@@ -38,13 +38,22 @@ float layerWeightOf(float layer, vec4 w) {
 
 float layerBaseRadius(float layer, float curveHash, float outerReach) {
   float t = fract(curveHash * 0.917 + 0.13);
-  if (layer < 0.5) return mix(0.085, 0.14, t);
-  if (layer < 1.5) return mix(0.16, 0.24, t);
-  if (layer < 2.5) return mix(0.25, 0.38, t);
-  return mix(0.42, min(0.58, outerReach * 0.78), t);
+  // Core 0.04?0.18 / Inner 0.14?0.34 / Mid 0.28?0.55 / Outer 0.45?0.82
+  if (layer < 0.5) return mix(0.06, 0.16, t);
+  if (layer < 1.5) return mix(0.16, 0.30, t);
+  if (layer < 2.5) return mix(0.30, 0.48, t);
+  return mix(0.48, clamp(outerReach, 0.55, 0.82), t);
 }
 
-// Returns polar (r, thetaLocal) in half-sector before kaleidoscope copy
+float layerWarp(float layer, float foldAmount, float lobeDepth) {
+  if (layer < 0.5) return 0.035 + foldAmount * 0.04;
+  if (layer < 1.5) return 0.06 + foldAmount * 0.08;
+  if (layer < 2.5) return 0.08 + lobeDepth * 0.55;
+  return 0.10 + lobeDepth * 0.7;
+}
+
+// Returns polar (r, thetaLocal?[-1,1]) in half-sector before kaleidoscope copy.
+// Autonomous motion ? 65%; audio modulates amplitude ? 35%.
 vec2 polarLocal(
   float u,
   float curveId,
@@ -71,54 +80,76 @@ vec2 polarLocal(
 ) {
   float lp = layerPhaseOf(layer, layerPhase);
   float morph = time * flowSpeed;
-  // Noise coordinates move smoothly along the curve and slowly through time;
-  // there is no per-point random displacement.
-  float n0 = smoothNoise3(vec3(curveId * 0.2, u * 1.5, morph * 0.075));
-  float n1 = smoothNoise3(vec3(curveId * 0.2 + 9.7, u * 1.15, morph * 0.051 + 4.0));
+  float n0 = smoothNoise3(vec3(curveId * 0.17, u * 1.35, morph * 0.065));
+  float n1 = smoothNoise3(vec3(curveId * 0.17 + 9.7, u * 1.05, morph * 0.048 + 4.0));
   float correlated = (n0 - 0.5) * 2.0;
 
-  float base = layerBaseRadius(layer, curveId + rnd, outerReach);
   float inner = 1.0 - step(0.5, layer);
   float outer = step(2.5, layer);
   float middle = 1.0 - inner - outer;
+  float audioW = 0.32; // audio weight 25?40%
+  float autoW = 1.0 - audioW;
 
-  float span = inner * 0.15 + middle * mix(0.24, 0.34, step(1.5, layer)) + outer * 0.42;
-  span *= 1.0 + bass * (inner * 0.12 + middle * 0.2 + outer * 0.28);
+  float waveA = sin(u * TAU * waveOrderA + morph * 0.23 + curveId + phase);
+  float waveB = cos(u * TAU * waveOrderB - morph * 0.17 + layer + lp);
+  float warp = layerWarp(layer, foldAmount, lobeDepth);
 
-  // Non-monotonic radial progress makes neighboring radius layers weave through
-  // one another instead of producing spokes or concentric rings.
-  float radialProgress = u;
-  radialProgress += (0.12 + foldAmount * 0.08 + mid * 0.08)
-    * sin(u * TAU * mix(1.5, 2.5, n1) + phase + lp + morph * 0.19);
-  radialProgress += 0.055 * sin(u * TAU * (waveOrderB + 0.5) - morph * 0.13 + curveId);
-  float r = base + span * radialProgress;
-  r += lobeDepth * (0.35 + mid * 0.55)
-    * sin(u * TAU * waveOrderA + phase - morph * 0.23 + lp);
-  r += correlated * (0.018 + middle * 0.025 + outer * 0.018);
-  r += bass * (0.018 + layer * 0.011);
+  // --- Topology A: arc ribbon / nested loop ---
+  float baseA = layerBaseRadius(layer, curveId + rnd, outerReach);
+  float spanA = inner * 0.10 + middle * mix(0.18, 0.28, step(1.5, layer)) + outer * 0.30;
+  float rA = baseA + spanA * u;
+  rA += autoW * warp * (0.58 * waveA + 0.42 * waveB);
+  rA += autoW * correlated * (0.014 + middle * 0.02);
+  float seedA = (fract(curveId * 0.371 + rnd * 0.23) - 0.5) * 0.85;
+  float thA = seedA
+    + mix(0.95, 0.35, outer) * (u - 0.5)
+    + autoW * (0.28 + foldAmount * 0.42) * sin(u * TAU * mix(1.1, 2.2, n0) + phase + morph * 0.15)
+    + autoW * (0.12 + angularFlow) * sin(u * TAU * waveOrderB - morph * 0.1 + lp);
 
-  // Tangential sweep, fold and curl use deliberately unrelated periods.
-  float seedAngle = (fract(curveId * 0.371 + rnd * 0.23) - 0.5) * 1.25;
-  float sweep = mix(1.15, 0.52, outer) * (u - 0.5);
-  float bend = (0.34 + foldAmount * 0.5 + mid * 0.48)
-    * sin(u * TAU * mix(1.0, 2.4, n0) + phase + morph * 0.17);
-  float curl = (0.16 + angularFlow * 1.4 + mid * 0.2)
-    * sin(u * TAU * waveOrderB - phase * 0.7 - morph * 0.11 + lp);
-  float rollBack = outer * 0.34 * sin(pow(u, 1.4) * TAU * 1.25 + phase + morph * 0.09);
-  float th = seedAngle + sweep + bend + curl + rollBack + correlated * 0.16;
+  // --- Topology B: radial tendril / open arc ---
+  float baseB = layerBaseRadius(layer, curveId + rnd + 3.1, outerReach);
+  float reachB = mix(0.22, 0.55, outer + middle * 0.55);
+  float rB = baseB + reachB * pow(u, mix(0.85, 1.25, outer));
+  rB += autoW * warp * 0.75 * sin(u * TAU * (waveOrderA * 0.5) + morph * 0.19 + phase);
+  rB += autoW * correlated * 0.02;
+  float seedB = (fract(curveId * 0.613 + rnd * 0.41) - 0.5) * 1.1;
+  float thB = seedB
+    + mix(0.55, 0.18, outer) * (u - 0.5)
+    + autoW * (0.22 + foldAmount * 0.35) * sin(u * TAU * 1.6 + phase - morph * 0.13)
+    + autoW * outer * 0.38 * sin(pow(u, 1.35) * TAU * 1.1 + phase + morph * 0.08);
 
-  float rNorm = clamp(r / max(outerReach, 0.55), 0.0, 1.15);
+  float topo = smoothstep(0.0, 1.0, topologyMix);
+  float r = mix(rA, rB, topo);
+  float th = mix(thA, thB, topo);
+
+  // Audio modulation (does not replace autonomous base)
+  r += audioW * bass * (0.028 + layer * 0.014);
+  r += audioW * mid * lobeDepth * 0.55 * sin(u * TAU * waveOrderA + phase + lp);
+  r += audioW * volume * 0.018 * sin(morph * 0.31 + lp + u * TAU);
+  th += audioW * mid * (0.18 + foldAmount * 0.22)
+    * sin(u * TAU * mix(1.2, 2.4, n1) + phase + morph * 0.14);
+  th += audioW * treble * 0.12 * sin(u * TAU * waveOrderB - morph * 0.2 + curveId);
+  th += audioW * angularFlow * 0.35 * mid;
+
+  // Travelling burst wave from center (transient/onset)
+  float rNorm = clamp(r / max(outerReach, 0.55), 0.0, 1.2);
   float pulse = 0.0;
   for (int i = 0; i < 4; i++) {
     float d = rNorm - pulsePosition[i];
     pulse += pulseAmplitude[i] * exp(-(d * d) / 0.0065);
   }
-  // Onsets bend a narrow radial band as it travels; they never scale the field.
-  r += pulse * (0.025 + middle * 0.035 + outer * 0.045);
-  th += pulse * (0.08 + 0.04 * sin(curveId * 2.3 + u * TAU));
+  r += pulse * (0.03 + middle * 0.035 + outer * 0.05);
+  th += pulse * (0.07 + 0.04 * sin(curveId * 2.3 + u * TAU));
+  r += transient * audioW * 0.02 * outer * sin(u * TAU * 3.0 + morph);
 
-  r += volume * 0.012 * sin(morph * 0.31 + lp + u * TAU);
-  r = clamp(r, 0.055, outerReach + outer * 0.13);
+  // Outer tendrils periodically retract (avoid static sun icon)
+  if (outer > 0.5) {
+    float gate = 0.55 + 0.45 * sin(lp * 0.9 + curveId * 1.7 + morph * 0.07);
+    r = mix(baseA * 1.05, r, clamp(gate, 0.15, 1.0));
+  }
+
+  r = clamp(r, 0.04, outerReach + outer * 0.12);
+  th = clamp(th, -1.35, 1.35);
   return vec2(r, th);
 }
 `;
@@ -129,11 +160,13 @@ in float vAlpha;
 in float vColorMix;
 out vec4 fragColor;
 void main() {
-  vec3 lilac = vec3(0.58, 0.52, 0.78);
-  vec3 silver = vec3(0.9, 0.88, 0.96);
-  vec3 softPink = vec3(0.72, 0.48, 0.68);
-  vec3 col = mix(lilac, softPink, vColorMix * 0.35);
-  col = mix(col, silver, 0.45);
+  // Silver / soft lilac primary; desaturated brand pink as accent
+  vec3 silver = vec3(0.90, 0.88, 0.96);
+  vec3 lilac = vec3(0.62, 0.56, 0.78);
+  vec3 softPink = vec3(0.78, 0.52, 0.70);
+  vec3 col = mix(silver, lilac, 0.42);
+  col = mix(col, softPink, vColorMix * 0.28);
+  col = mix(col, silver, 0.35);
   fragColor = vec4(col, vAlpha);
 }
 `;
@@ -183,7 +216,8 @@ vec2 toCartesian(vec2 polar, float sectorCount, float rotationIndex, float mirro
   float theta = rotationIndex * sectorAngle
               + mirrorSign * (polar.y * sectorHalf)
               + globalPhase;
-  vec2 p = vec2(cos(theta), sin(theta)) * polar.x;
+  // Scale radius/position only (~25%); pixel line width & spacing stay unchanged
+  vec2 p = vec2(cos(theta), sin(theta)) * (polar.x * 1.25);
   p.x /= max(aspect, 0.001);
   return p;
 }
@@ -216,9 +250,9 @@ void main() {
   vec2 p = toCartesian(pol, sectorCount, aCopy.x, aCopy.y, uGlobalPhase, uAspect);
 
   gl_Position = vec4(p, 0.0, 1.0);
-  gl_PointSize = mix(0.5, 0.9, rnd) + uTreble * 0.2;
+  gl_PointSize = mix(0.55, 0.85, rnd) + uTreble * 0.15;
   float lw = layerWeightOf(layer, uLayerWeight);
-  vAlpha = (0.04 + 0.05 * effectiveVol + uTransient * 0.04) * lw * uAlphaMul;
+  vAlpha = (0.055 + 0.06 * effectiveVol + uTransient * 0.05) * lw * uAlphaMul;
   vColorMix = clamp(0.35 + uCentroid * 0.4 + rnd * 0.2, 0.0, 1.0);
 }
 `;
@@ -368,10 +402,11 @@ interface TierConfig {
 }
 
 const TIER: Record<QualityTier, TierConfig> = {
-  high: { strands: 16, samples: 96, curves: [2, 2, 3, 1], beads: 12, spacingPx: 1.0, lineHalfPx: 0.55 },
-  medium: { strands: 12, samples: 72, curves: [2, 2, 2, 1], beads: 8, spacingPx: 1.15, lineHalfPx: 0.5 },
-  low: { strands: 10, samples: 56, curves: [1, 2, 2, 1], beads: 5, spacingPx: 1.35, lineHalfPx: 0.5 },
-  fallback: { strands: 8, samples: 48, curves: [1, 1, 2, 1], beads: 3, spacingPx: 1.5, lineHalfPx: 0.5 },
+  // Budget prioritizes parallel strands while staying interactive
+  high: { strands: 16, samples: 128, curves: [2, 3, 3, 2], beads: 20, spacingPx: 1.6, lineHalfPx: 0.45 },
+  medium: { strands: 12, samples: 96, curves: [2, 2, 3, 1], beads: 12, spacingPx: 1.8, lineHalfPx: 0.45 },
+  low: { strands: 9, samples: 80, curves: [1, 2, 2, 1], beads: 8, spacingPx: 2.1, lineHalfPx: 0.5 },
+  fallback: { strands: 7, samples: 64, curves: [1, 1, 2, 1], beads: 4, spacingPx: 2.4, lineHalfPx: 0.5 },
 };
 
 const MAX_SECTORS = 10;
@@ -389,7 +424,9 @@ export class CurveRenderer {
   private beadVao: WebGLVertexArrayObject;
   private quadVao: WebGLVertexArrayObject;
   private ribbonVertCount = 0;
+  private ribbonInstanceCount = 0;
   private beadCount = 0;
+  private beadInstanceCount = 0;
 
   private quality: QualityTier = 'medium';
   private usePost = true;
@@ -434,8 +471,8 @@ export class CurveRenderer {
     });
     if (!gl) throw new Error('WebGL2 not supported');
     this.gl = gl;
-    // Short trail on high/medium; keep single-frame topology readable
-    this.usePost = quality === 'high' || quality === 'medium';
+    // High: short trail + low Bloom; Medium/Low: weak trail only; Fallback: direct
+    this.usePost = quality === 'high';
     this.tierCfg = TIER[quality];
     this.quality = quality;
 
@@ -475,7 +512,7 @@ export class CurveRenderer {
     if (tier === this.quality) return;
     this.quality = tier;
     this.tierCfg = TIER[tier];
-    this.usePost = tier === 'high' || tier === 'medium';
+    this.usePost = tier === 'high';
     this.rebuildGeometry();
     this.resize(this.cssW, this.cssH);
   }
@@ -488,7 +525,7 @@ export class CurveRenderer {
     return this.quality;
   }
 
-  /** Approx visible elements for debug (curves × strands × sectors × 2). */
+  /** Approx visible elements for debug (curves ? strands ? sectors ? 2). */
   getParticleCount(): number {
     return this.elementCount;
   }
@@ -546,7 +583,7 @@ export class CurveRenderer {
     if (!this.usePost || !this.trailA || !this.trailB) {
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
       gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
-      gl.clearColor(0.02, 0.012, 0.035, 1);
+      gl.clearColor(0.02, 0.012, 0.035, 1); // #050309
       gl.clear(gl.COLOR_BUFFER_BIT);
       this.drawField(t, breath, aspect, features, morph);
       return;
@@ -554,7 +591,13 @@ export class CurveRenderer {
 
     const read = this.currTrailIsA ? this.trailA : this.trailB;
     const write = this.currTrailIsA ? this.trailB : this.trailA;
-    const decay = this.reduceMotion ? 0.5 : 0.62;
+    const decay = this.reduceMotion
+      ? 0.55
+      : this.quality === 'high'
+        ? 0.76
+        : this.quality === 'medium'
+          ? 0.72
+          : 0.68;
 
     gl.bindFramebuffer(gl.FRAMEBUFFER, write.fbo);
     gl.viewport(0, 0, write.w, write.h);
@@ -574,7 +617,7 @@ export class CurveRenderer {
     const doBloom =
       !!this.bloomA &&
       !!this.bloomB &&
-      (this.quality === 'high' || this.quality === 'medium') &&
+      (this.quality === 'high') &&
       !this.reduceMotion;
 
     if (doBloom && this.bloomA && this.bloomB) {
@@ -585,7 +628,7 @@ export class CurveRenderer {
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, sceneTex);
       gl.uniform1i(gl.getUniformLocation(this.bloomProg, 'uTex'), 0);
-      gl.uniform1f(gl.getUniformLocation(this.bloomProg, 'uThreshold'), 0.85);
+      gl.uniform1f(gl.getUniformLocation(this.bloomProg, 'uThreshold'), 0.88);
       gl.uniform2f(gl.getUniformLocation(this.bloomProg, 'uDirection'), 1 / this.bloomA.w, 0);
       this.drawQuad();
       gl.bindFramebuffer(gl.FRAMEBUFFER, this.bloomB.fbo);
@@ -608,7 +651,7 @@ export class CurveRenderer {
       gl.uniform1i(gl.getUniformLocation(this.compositeProg, 'uBloom'), 1);
       gl.uniform1f(
         gl.getUniformLocation(this.compositeProg, 'uBloomStrength'),
-        this.quality === 'high' ? 0.07 : 0.05,
+        this.quality === 'high' ? 0.08 : 0.05,
       );
     } else {
       gl.useProgram(this.copyProg);
@@ -751,7 +794,8 @@ export class CurveRenderer {
   ): void {
     const gl = this.gl;
     gl.enable(gl.BLEND);
-    gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    // Spec: SRC_ALPHA, ONE additive; overlaps brighten naturally
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
     gl.useProgram(this.ribbonProg);
     gl.bindVertexArray(this.ribbonVao);
     this.setMorphUniforms(this.uRibbon, morph, sectorCount, alphaMul, t, breath, aspect, features);
@@ -759,7 +803,7 @@ export class CurveRenderer {
     gl.uniform1f(this.uRibbon.uLineHalfPx!, this.tierCfg.lineHalfPx);
     gl.uniform1f(this.uRibbon.uBundleSpacingPx!, this.tierCfg.spacingPx);
     gl.uniform1f(this.uRibbon.uSamplesPerCurve!, this.tierCfg.samples);
-    gl.drawArrays(gl.LINES, 0, this.ribbonVertCount);
+    gl.drawArraysInstanced(gl.LINES, 0, this.ribbonVertCount, this.ribbonInstanceCount);
     gl.bindVertexArray(null);
   }
 
@@ -789,7 +833,7 @@ export class CurveRenderer {
     gl.bindVertexArray(this.beadVao);
     this.setMorphUniforms(this.uBead, morph, sectorCount, alphaMul, t, breath, aspect, features);
     gl.uniform1f(this.uBead.uBeadSpeed!, 0.025 + features.spectralFlux * 0.13 + features.treble * 0.025);
-    gl.drawArrays(gl.POINTS, 0, this.beadCount);
+    gl.drawArraysInstanced(gl.POINTS, 0, this.beadCount, this.beadInstanceCount);
     gl.bindVertexArray(null);
   }
 
@@ -798,7 +842,7 @@ export class CurveRenderer {
     const { strands, samples, curves, beads, spacingPx } = this.tierCfg;
     void spacingPx;
 
-    // --- Expanded line segments (no instancing — more reliable for GL_LINES) ---
+    // Base curve segments once; kaleidoscope copies via instancing (rot ? mirror)
     const verts: number[] = [];
     let curveId = 0;
     for (let layer = 0; layer < 4; layer++) {
@@ -811,29 +855,11 @@ export class CurveRenderer {
         for (let s = 0; s < strands; s++) {
           const strandOffset = s - (strands - 1) * 0.5;
           const lineRole = Math.abs(strandOffset) < 0.6 ? 0 : 1;
-          for (let rot = 0; rot < MAX_SECTORS; rot++) {
-            for (let m = 0; m < 2; m++) {
-              const mirrorSign = m === 0 ? 1 : -1;
-              for (let i = 0; i < samples - 1; i++) {
-                const u0 = i / (samples - 1);
-                const u1 = (i + 1) / (samples - 1);
-                for (const u of [u0, u1]) {
-                  // aPrim(4) + aMeta(4): lineRole, phase, rnd, unused + will pack copy into meta.w? 
-                  // Use 10 floats: prim4, meta2 (role,phase), rnd, pad, rot, mirror
-                  verts.push(
-                    u,
-                    cid,
-                    layer,
-                    strandOffset,
-                    lineRole,
-                    phase,
-                    rndAbs,
-                    0,
-                    rot,
-                    mirrorSign,
-                  );
-                }
-              }
+          for (let i = 0; i < samples - 1; i++) {
+            const u0 = i / (samples - 1);
+            const u1 = (i + 1) / (samples - 1);
+            for (const u of [u0, u1]) {
+              verts.push(u, cid, layer, strandOffset, lineRole, phase, rndAbs, 0);
             }
           }
         }
@@ -842,25 +868,36 @@ export class CurveRenderer {
     }
 
     const ribbonData = new Float32Array(verts);
-    this.ribbonVertCount = verts.length / 10;
+    this.ribbonVertCount = verts.length / 8;
+
+    const copies: number[] = [];
+    for (let rot = 0; rot < MAX_SECTORS; rot++) {
+      copies.push(rot, 1);
+      copies.push(rot, -1);
+    }
+    this.ribbonInstanceCount = copies.length / 2;
 
     gl.bindVertexArray(this.ribbonVao);
     const ribbonBuf = gl.createBuffer()!;
     gl.bindBuffer(gl.ARRAY_BUFFER, ribbonBuf);
     gl.bufferData(gl.ARRAY_BUFFER, ribbonData, gl.STATIC_DRAW);
-    const stride = 10 * 4;
+    const stride = 8 * 4;
     gl.enableVertexAttribArray(0);
     gl.vertexAttribPointer(0, 4, gl.FLOAT, false, stride, 0);
     gl.enableVertexAttribArray(1);
     gl.vertexAttribPointer(1, 4, gl.FLOAT, false, stride, 16);
-    gl.enableVertexAttribArray(2);
-    gl.vertexAttribPointer(2, 2, gl.FLOAT, false, stride, 32);
     gl.vertexAttribDivisor(0, 0);
     gl.vertexAttribDivisor(1, 0);
-    gl.vertexAttribDivisor(2, 0);
+
+    const copyBuf = gl.createBuffer()!;
+    gl.bindBuffer(gl.ARRAY_BUFFER, copyBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(copies), gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(2);
+    gl.vertexAttribPointer(2, 2, gl.FLOAT, false, 8, 0);
+    gl.vertexAttribDivisor(2, 1);
     gl.bindVertexArray(null);
 
-    // --- Beads (also expanded) ---
+    // Beads: base seeds + same sector instances
     const beadVerts: number[] = [];
     for (let i = 0; i < beads; i++) {
       const layer = i % 4;
@@ -874,28 +911,28 @@ export class CurveRenderer {
       let seed3 = (Math.sin(i * 19.1) * 43758.5453) % 1;
       seed3 -= Math.floor(seed3);
       const u0 = (i * 0.173) % 1;
-      for (let rot = 0; rot < MAX_SECTORS; rot++) {
-        for (let m = 0; m < 2; m++) {
-          beadVerts.push(seed0, seed1, seed2, seed3, u0, rot, m === 0 ? 1 : -1);
-        }
-      }
+      beadVerts.push(seed0, seed1, seed2, seed3, u0);
     }
-    this.beadCount = beadVerts.length / 7;
+    this.beadCount = beadVerts.length / 5;
+    this.beadInstanceCount = this.ribbonInstanceCount;
 
     gl.bindVertexArray(this.beadVao);
     const beadBuf = gl.createBuffer()!;
     gl.bindBuffer(gl.ARRAY_BUFFER, beadBuf);
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(beadVerts), gl.STATIC_DRAW);
-    const bstride = 7 * 4;
     gl.enableVertexAttribArray(0);
-    gl.vertexAttribPointer(0, 4, gl.FLOAT, false, bstride, 0);
+    gl.vertexAttribPointer(0, 4, gl.FLOAT, false, 20, 0);
     gl.enableVertexAttribArray(1);
-    gl.vertexAttribPointer(1, 1, gl.FLOAT, false, bstride, 16);
-    gl.enableVertexAttribArray(2);
-    gl.vertexAttribPointer(2, 2, gl.FLOAT, false, bstride, 20);
+    gl.vertexAttribPointer(1, 1, gl.FLOAT, false, 20, 16);
     gl.vertexAttribDivisor(0, 0);
     gl.vertexAttribDivisor(1, 0);
-    gl.vertexAttribDivisor(2, 0);
+
+    const beadCopyBuf = gl.createBuffer()!;
+    gl.bindBuffer(gl.ARRAY_BUFFER, beadCopyBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(copies), gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(2);
+    gl.vertexAttribPointer(2, 2, gl.FLOAT, false, 8, 0);
+    gl.vertexAttribDivisor(2, 1);
     gl.bindVertexArray(null);
   }
 
@@ -1016,7 +1053,7 @@ export class CurveRenderer {
       this.fpsLast = now;
       if (this.fps < 45) {
         this.lowFpsMs += dt;
-        if (this.lowFpsMs > 2000) {
+        if (this.lowFpsMs > 3500) {
           if (this.quality === 'high') this.setQuality('medium');
           else if (this.quality === 'medium') this.setQuality('low');
           else if (this.quality === 'low') this.setQuality('fallback');
@@ -1078,7 +1115,8 @@ vec2 toCartesian(vec2 polar, float sectorCount, float rotationIndex, float mirro
   float theta = rotationIndex * sectorAngle
               + mirrorSign * (polar.y * sectorHalf)
               + globalPhase;
-  vec2 p = vec2(cos(theta), sin(theta)) * polar.x;
+  // Scale radius/position only (~25%); pixel line width & spacing stay unchanged
+  vec2 p = vec2(cos(theta), sin(theta)) * (polar.x * 1.25);
   p.x /= max(aspect, 0.001);
   return p;
 }
@@ -1134,37 +1172,37 @@ void main() {
   vec2 tangentPx = normalize(vec2((posB.x - posA.x) * uAspect, posB.y - posA.y) + vec2(1e-5, 0.0));
   vec2 normalPx = vec2(-tangentPx.y, tangentPx.x);
 
-  float bundleNoise = smoothNoise3(vec3(curveId * 0.2 + 21.0, u * 1.5, uTime * 0.045));
-  float gather = 0.52
-    + 0.38 * sin(u * TAU * 1.7 + phase + uTime * 0.12)
-    + 0.22 * sin(u * TAU * 3.1 - phase * 0.4 - uTime * 0.073)
-    + (bundleNoise - 0.5) * 0.34;
-  gather = clamp(gather, 0.18, 1.18);
-  float split = smoothstep(0.48, 0.9, sin(u * TAU * 2.2 + curveId + uTime * 0.09));
-  float side = sign(strandOffset);
-  float localSpacingPx = uBundleSpacingPx * gather * (1.0 + uBass * 0.42);
-  float offsetPx = strandOffset * localSpacingPx
-    + side * split * abs(strandOffset) * abs(strandOffset) * 0.045;
+  float bundleNoise = smoothNoise3(vec3(curveId * 0.2 + 21.0, u * 1.15, uTime * 0.035));
+  // Stable parallel spacing 1.2?3.5 px class; only mild radius-linked expansion
+  float gather = 0.92
+    + 0.10 * sin(u * TAU * 0.85 + phase + uTime * 0.08)
+    + (bundleNoise - 0.5) * 0.08;
+  gather = clamp(gather, 0.78, 1.18);
+  float radiusExpand = 1.0 + clamp(pol.x / max(uOuterReach, 0.55), 0.0, 1.0) * 0.35;
+  float localSpacingPx = uBundleSpacingPx * gather * radiusExpand * (1.0 + uBass * 0.22);
+  float offsetPx = strandOffset * localSpacingPx;
   vec2 offsetNdc = vec2(normalPx.x / max(uAspect, 0.001), normalPx.y)
     * (2.0 * offsetPx / max(uViewportY, 1.0));
   pos += offsetNdc;
 
   float lw = layerWeightOf(layer, uLayerWeight);
-  float alpha = mix(0.38, 0.18, lineRole) * lw;
-  alpha *= mix(1.0, 0.45, clamp(pol.x / max(uOuterReach, 0.55), 0.0, 1.0));
+  // Keep alpha low under additive blend so center overlaps stay linear
+  float alpha = mix(0.22, 0.10, lineRole) * lw;
+  alpha *= mix(1.0, 0.42, clamp(pol.x / max(uOuterReach, 0.55), 0.0, 1.0));
+  if (layer < 0.5) alpha *= 0.55;
   if (layer > 2.5) {
-    float gate = smoothstep(0.08, 0.6, 0.5 + 0.5 * sin(layerPhaseOf(layer, uLayerPhase) * 0.85 + curveId * 2.1 + phase));
-    alpha *= mix(0.1, 1.0, gate);
+    float gate = smoothstep(0.08, 0.55, 0.5 + 0.5 * sin(layerPhaseOf(layer, uLayerPhase) * 0.85 + curveId * 2.1 + phase));
+    alpha *= mix(0.12, 1.0, gate);
   }
   alpha *= uAlphaMul;
-  alpha *= mix(1.0, 0.8, uReduceMotion);
+  alpha *= mix(1.0, 0.7, uReduceMotion);
 
   gl_Position = vec4(pos, 0.0, 1.0);
-  // Centroid increases crisp fine-line density by revealing outer bundle hairs.
-  alpha *= mix(0.78, 1.08, uCentroid);
-  alpha *= 0.92 + 0.08 * sin(u * TAU * (7.0 + uTreble * 5.0) + curveId);
-  vAlpha = clamp(alpha, 0.0, 0.45);
-  vColorMix = clamp(0.15 + layer * 0.12 + uCentroid * 0.25 + rnd * 0.1, 0.0, 1.0);
+  alpha *= mix(0.88, 1.02, uCentroid);
+  float dash = smoothstep(0.12, 0.4, abs(sin(u * TAU * (5.0 + uTreble * 2.5) + curveId)));
+  alpha *= mix(0.78, 1.0, dash);
+  vAlpha = clamp(alpha, 0.0, 0.28);
+  vColorMix = clamp(0.12 + layer * 0.1 + uCentroid * 0.28 + rnd * 0.08, 0.0, 1.0);
 }
 `;
 }

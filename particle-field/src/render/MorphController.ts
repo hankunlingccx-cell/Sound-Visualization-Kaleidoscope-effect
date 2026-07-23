@@ -19,7 +19,7 @@ export interface MorphUniforms {
   layerWeight: [number, number, number, number];
 }
 
-const SECTOR_OPTIONS: SectorCount[] = [6, 8, 10];
+const SECTOR_OPTIONS: SectorCount[] = [6]; // keep six-fold while tuning negative space
 
 function clamp(v: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, v));
@@ -59,21 +59,21 @@ export class MorphController {
 
   private foldAmount = 0.58;
   private lobeDepth = 0.16;
-  private outerReach = 0.72;
+  private outerReach = 0.78;
   private flowSpeed = 0.2;
   private topologyMix = 0.48;
   private waveOrderA = 3;
   private waveOrderB = 5;
   private angularFlow = 0.16;
-  private layerWeight = new Float32Array([0.85, 0.9, 1.05, 0.95]);
+  private layerWeight = new Float32Array([0.55, 0.75, 1.1, 0.8]);
 
   private foldTarget = 0.58;
   private lobeTarget = 0.16;
-  private outerTarget = 0.72;
+  private outerTarget = 0.78;
   private flowTarget = 0.2;
   private topoTarget = 0.48;
   private angFlowTarget = 0.16;
-  private weightTargets = new Float32Array([0.85, 0.9, 1.05, 0.95]);
+  private weightTargets = new Float32Array([0.55, 0.75, 1.1, 0.8]);
 
   private nextParamAt = 5.5;
   private paramEpoch = 1;
