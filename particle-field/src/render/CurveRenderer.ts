@@ -52,8 +52,9 @@ float layerWarp(float layer, float foldAmount, float lobeDepth) {
   return 0.10 + lobeDepth * 0.7;
 }
 
-// Returns polar (r, thetaLocal?[-1,1]) in half-sector before kaleidoscope copy.
-// Autonomous motion ? 65%; audio modulates amplitude ? 35%.
+// Returns polar (r, thetaLocal in [0,1]) in the base half-sector.
+// Kaleidoscope fill: K rotations x (+/- mirror) -> full 2*pi with no wedge gap.
+// Autonomous motion ~65%; audio modulates amplitude ~35%.
 vec2 polarLocal(
   float u,
   float curveId,
@@ -87,12 +88,16 @@ vec2 polarLocal(
   float inner = 1.0 - step(0.5, layer);
   float outer = step(2.5, layer);
   float middle = 1.0 - inner - outer;
-  float audioW = 0.32; // audio weight 25?40%
+  float audioW = 0.32; // audio weight 25-40%
   float autoW = 1.0 - audioW;
 
   float waveA = sin(u * TAU * waveOrderA + morph * 0.23 + curveId + phase);
   float waveB = cos(u * TAU * waveOrderB - morph * 0.17 + layer + lp);
   float warp = layerWarp(layer, foldAmount, lobeDepth);
+
+  // Seeds span the full half-sector [0,1] so +/-mirror x K fills the circle.
+  float seedA = fract(curveId * 0.61803398875 + rnd * 0.37);
+  float seedB = fract(curveId * 0.38196601125 + rnd * 0.53 + 0.17);
 
   // --- Topology A: arc ribbon / nested loop ---
   float baseA = layerBaseRadius(layer, curveId + rnd, outerReach);
@@ -100,11 +105,11 @@ vec2 polarLocal(
   float rA = baseA + spanA * u;
   rA += autoW * warp * (0.58 * waveA + 0.42 * waveB);
   rA += autoW * correlated * (0.014 + middle * 0.02);
-  float seedA = (fract(curveId * 0.371 + rnd * 0.23) - 0.5) * 0.85;
+  // Keep angular travel small so seeds near 0/1 still leave edge coverage.
   float thA = seedA
-    + mix(0.95, 0.35, outer) * (u - 0.5)
-    + autoW * (0.28 + foldAmount * 0.42) * sin(u * TAU * mix(1.1, 2.2, n0) + phase + morph * 0.15)
-    + autoW * (0.12 + angularFlow) * sin(u * TAU * waveOrderB - morph * 0.1 + lp);
+    + mix(0.16, 0.06, outer) * (u - 0.5)
+    + autoW * (0.07 + foldAmount * 0.10) * sin(u * TAU * mix(1.1, 2.2, n0) + phase + morph * 0.15)
+    + autoW * (0.04 + angularFlow * 0.35) * sin(u * TAU * waveOrderB - morph * 0.1 + lp);
 
   // --- Topology B: radial tendril / open arc ---
   float baseB = layerBaseRadius(layer, curveId + rnd + 3.1, outerReach);
@@ -112,24 +117,24 @@ vec2 polarLocal(
   float rB = baseB + reachB * pow(u, mix(0.85, 1.25, outer));
   rB += autoW * warp * 0.75 * sin(u * TAU * (waveOrderA * 0.5) + morph * 0.19 + phase);
   rB += autoW * correlated * 0.02;
-  float seedB = (fract(curveId * 0.613 + rnd * 0.41) - 0.5) * 1.1;
   float thB = seedB
-    + mix(0.55, 0.18, outer) * (u - 0.5)
-    + autoW * (0.22 + foldAmount * 0.35) * sin(u * TAU * 1.6 + phase - morph * 0.13)
-    + autoW * outer * 0.38 * sin(pow(u, 1.35) * TAU * 1.1 + phase + morph * 0.08);
+    + mix(0.14, 0.05, outer) * (u - 0.5)
+    + autoW * (0.06 + foldAmount * 0.09) * sin(u * TAU * 1.6 + phase - morph * 0.13)
+    + autoW * outer * 0.10 * sin(pow(u, 1.35) * TAU * 1.1 + phase + morph * 0.08);
 
   float topo = smoothstep(0.0, 1.0, topologyMix);
   float r = mix(rA, rB, topo);
   float th = mix(thA, thB, topo);
 
-  // Audio modulation (does not replace autonomous base)
+  // Audio modulation (does not replace autonomous base).
+  // Angular terms must be zero-mean; a DC bias opens a directional C-gap.
   r += audioW * bass * (0.028 + layer * 0.014);
   r += audioW * mid * lobeDepth * 0.55 * sin(u * TAU * waveOrderA + phase + lp);
   r += audioW * volume * 0.018 * sin(morph * 0.31 + lp + u * TAU);
-  th += audioW * mid * (0.18 + foldAmount * 0.22)
+  th += audioW * mid * (0.05 + foldAmount * 0.06)
     * sin(u * TAU * mix(1.2, 2.4, n1) + phase + morph * 0.14);
-  th += audioW * treble * 0.12 * sin(u * TAU * waveOrderB - morph * 0.2 + curveId);
-  th += audioW * angularFlow * 0.35 * mid;
+  th += audioW * treble * 0.04 * sin(u * TAU * waveOrderB - morph * 0.2 + curveId);
+  th += audioW * angularFlow * 0.08 * mid * sin(morph * 0.19 + lp + curveId);
 
   // Travelling burst wave from center (transient/onset)
   float rNorm = clamp(r / max(outerReach, 0.55), 0.0, 1.2);
@@ -139,7 +144,7 @@ vec2 polarLocal(
     pulse += pulseAmplitude[i] * exp(-(d * d) / 0.0065);
   }
   r += pulse * (0.03 + middle * 0.035 + outer * 0.05);
-  th += pulse * (0.07 + 0.04 * sin(curveId * 2.3 + u * TAU));
+  th += pulse * 0.035 * sin(curveId * 2.3 + u * TAU + lp);
   r += transient * audioW * 0.02 * outer * sin(u * TAU * 3.0 + morph);
 
   // Outer tendrils periodically retract (avoid static sun icon)
@@ -149,7 +154,7 @@ vec2 polarLocal(
   }
 
   r = clamp(r, 0.04, outerReach + outer * 0.12);
-  th = clamp(th, -1.35, 1.35);
+  th = clamp(th, 0.0, 1.0);
   return vec2(r, th);
 }
 `;

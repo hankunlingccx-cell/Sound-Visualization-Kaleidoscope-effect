@@ -19,7 +19,7 @@ export interface MorphUniforms {
   layerWeight: [number, number, number, number];
 }
 
-const SECTOR_OPTIONS: SectorCount[] = [6]; // keep six-fold while tuning negative space
+const SECTOR_OPTIONS: SectorCount[] = [6]; // six-fold; expand to 6/8/10 when crossfade is re-enabled
 
 function clamp(v: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, v));
