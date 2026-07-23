@@ -1,10 +1,15 @@
 :root {
-  --bg: #050309;
-  --pink: #ff3dce;
-  --purple: #7b61ff;
-  --lilac: #c7b7ff;
-  --text: #f4eefc;
-  --muted: rgba(199, 183, 255, 0.62);
+  --bg: #000000;
+  --mint: #63e0cb;
+  --ice: #d9fff8;
+  --lake: #4fa9e8;
+  --violet: #7667e8;
+  --blush: #d879c8;
+  --pink: #d879c8;
+  --purple: #7667e8;
+  --lilac: #63e0cb;
+  --text: #d9fff8;
+  --muted: rgba(99, 224, 203, 0.55);
   --danger: #ff5a7a;
   --font-display: "Syne", "Avenir Next", "Segoe UI", sans-serif;
   --font-mono: "IBM Plex Mono", "SF Mono", Consolas, monospace;

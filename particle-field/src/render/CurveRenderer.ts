@@ -152,22 +152,83 @@ vec2 polarLocal(
   th = clamp(th, -1.35, 1.35);
   return vec2(r, th);
 }
+
+// Audio-responsive mint palette (#63E0CB dominant)
+vec3 colMain()  { return vec3(0.388235, 0.878431, 0.796078); }
+vec3 colBass()  { return vec3(0.309804, 0.662745, 0.909804); }
+vec3 colMidHue(){ return vec3(0.462745, 0.403922, 0.909804); }
+vec3 colHigh()  { return vec3(0.850980, 1.000000, 0.972549); }
+vec3 colOnset() { return vec3(0.847059, 0.474510, 0.784314); }
+
+vec3 sampleFlowGradient(float t) {
+  float x = fract(t) * 3.0;
+  if (x < 1.0) return mix(colBass(), colMain(), smoothstep(0.0, 1.0, x));
+  if (x < 2.0) return mix(colMain(), colHigh(), smoothstep(0.0, 1.0, x - 1.0));
+  return mix(colHigh(), colMidHue(), smoothstep(0.0, 1.0, x - 2.0));
+}
+
+vec3 computeLineColor(
+  float u,
+  float curveId,
+  float layer,
+  float strandOffset,
+  float phase,
+  float time,
+  float reduceMotion,
+  float cBass,
+  float cMid,
+  float cHigh,
+  float cOnset,
+  float cVol,
+  float cAct,
+  float pulseLocal
+) {
+  vec3 audioColor = colMain();
+  audioColor = mix(audioColor, colBass(), cBass * 0.35);
+  audioColor = mix(audioColor, colMidHue(), cMid * 0.45);
+  audioColor = mix(audioColor, colHigh(), cHigh * 0.30);
+  audioColor = mix(audioColor, colOnset(), cOnset * 0.55);
+
+  float travel = time * mix(0.026, 0.01, reduceMotion);
+  float gradientPhase = fract(u - travel * 0.25 + curveId * 0.13 + strandOffset * 0.018);
+  vec3 flowing = sampleFlowGradient(gradientPhase);
+
+  float flowAmt = 0.16 + cMid * 0.10 + cBass * 0.06;
+  vec3 col = mix(colMain(), flowing, flowAmt);
+  col = mix(col, audioColor, 0.18 + cAct * 0.16);
+
+  float seg = smoothstep(0.12, 0.5, 0.5 + 0.5 * sin(u * 6.28318530718 * 1.4 + phase + curveId));
+  if (layer < 0.5) {
+    col = mix(col, mix(colMain(), colHigh(), 0.55), seg * (0.18 + cHigh * 0.28));
+  } else if (layer < 2.5) {
+    col = mix(col, mix(colMain(), colMidHue(), 0.72), seg * (0.14 + cMid * 0.38));
+  } else {
+    col = mix(col, mix(colBass(), colMain(), 0.4), 0.16 + cBass * 0.32);
+    float edge = smoothstep(1.8, 4.2, abs(strandOffset));
+    col = mix(col, colHigh(), edge * cHigh * 0.28);
+  }
+
+  col = mix(col, colOnset(), clamp(pulseLocal, 0.0, 1.0) * 0.55);
+
+  // Lift overall exposure; silent still readable mint, peaks stay below flash-white
+  float brightness = mix(0.72, 1.08, clamp(cVol, 0.0, 1.0));
+  if (cVol < 0.07 && cAct < 0.08) {
+    brightness = mix(0.62, 0.78, 0.5 + 0.5 * sin(time * 0.8));
+  }
+  float sat = mix(0.82, 1.0, clamp(cAct, 0.0, 1.0));
+  float lum = dot(col, vec3(0.2126, 0.7152, 0.0722));
+  col = mix(vec3(lum), col, sat) * brightness;
+  return min(col, vec3(1.15));
+}
 `;
 
 const LINE_FRAG = `#version 300 es
 precision mediump float;
 in float vAlpha;
-in float vColorMix;
+in vec3 vColor;
 out vec4 fragColor;
 void main() {
-  // Silver / soft lilac primary; desaturated brand pink as accent
-  vec3 silver = vec3(0.90, 0.88, 0.96);
-  vec3 lilac = vec3(0.62, 0.56, 0.78);
-  vec3 softPink = vec3(0.78, 0.52, 0.70);
-  vec3 col = mix(silver, lilac, 0.42);
-  col = mix(col, softPink, vColorMix * 0.28);
-  col = mix(col, silver, 0.35);
-  fragColor = vec4(col, vAlpha);
+  fragColor = vec4(vColor, vAlpha);
 }
 `;
 
@@ -189,6 +250,12 @@ uniform float uBreath;
 uniform float uReduceMotion;
 uniform float uAlphaMul;
 uniform float uBeadSpeed;
+uniform float uColBass;
+uniform float uColMid;
+uniform float uColHigh;
+uniform float uColOnset;
+uniform float uColVolume;
+uniform float uColActivity;
 
 uniform float uSectorCount;
 uniform float uGlobalPhase;
@@ -206,7 +273,7 @@ uniform vec4 uPulsePosition;
 uniform vec4 uPulseAmplitude;
 
 out float vAlpha;
-out float vColorMix;
+out vec3 vColor;
 
 ${CENTERLINE_GLSL}
 
@@ -228,7 +295,7 @@ void main() {
     gl_Position = vec4(2.0, 2.0, 0.0, 1.0);
     gl_PointSize = 0.0;
     vAlpha = 0.0;
-    vColorMix = 0.0;
+    vColor = vec3(0.0);
     return;
   }
 
@@ -252,24 +319,33 @@ void main() {
   gl_Position = vec4(p, 0.0, 1.0);
   gl_PointSize = mix(0.55, 0.85, rnd) + uTreble * 0.15;
   float lw = layerWeightOf(layer, uLayerWeight);
-  vAlpha = (0.055 + 0.06 * effectiveVol + uTransient * 0.05) * lw * uAlphaMul;
-  vColorMix = clamp(0.35 + uCentroid * 0.4 + rnd * 0.2, 0.0, 1.0);
+  vAlpha = (0.10 + 0.08 * effectiveVol + uTransient * 0.06) * lw * uAlphaMul;
+
+  float rNormB = clamp(pol.x / max(uOuterReach, 0.55), 0.0, 1.2);
+  float pulseLocalB = 0.0;
+  for (int i = 0; i < 4; i++) {
+    float d = rNormB - uPulsePosition[i];
+    pulseLocalB += uPulseAmplitude[i] * exp(-(d * d) / 0.0065);
+  }
+  vColor = computeLineColor(
+    u, curveId, layer, 0.0, phase, uTime, uReduceMotion,
+    uColBass, uColMid, uColHigh, uColOnset, uColVolume, uColActivity,
+    pulseLocalB
+  );
 }
 `;
 
 const BEAD_FRAG = `#version 300 es
 precision mediump float;
 in float vAlpha;
-in float vColorMix;
+in vec3 vColor;
 out vec4 fragColor;
 void main() {
   vec2 p = gl_PointCoord - vec2(0.5);
   float d = length(p);
   if (d > 0.5) discard;
   float g = smoothstep(0.5, 0.0, d);
-  vec3 silver = vec3(0.92, 0.9, 0.96);
-  vec3 pink = vec3(0.85, 0.55, 0.78);
-  fragColor = vec4(mix(silver, pink, vColorMix * 0.5), g * vAlpha);
+  fragColor = vec4(vColor, g * vAlpha);
 }
 `;
 
@@ -402,11 +478,11 @@ interface TierConfig {
 }
 
 const TIER: Record<QualityTier, TierConfig> = {
-  // Budget prioritizes parallel strands while staying interactive
-  high: { strands: 16, samples: 128, curves: [2, 3, 3, 2], beads: 20, spacingPx: 1.6, lineHalfPx: 0.45 },
-  medium: { strands: 12, samples: 96, curves: [2, 2, 3, 1], beads: 12, spacingPx: 1.8, lineHalfPx: 0.45 },
-  low: { strands: 9, samples: 80, curves: [1, 2, 2, 1], beads: 8, spacingPx: 2.1, lineHalfPx: 0.5 },
-  fallback: { strands: 7, samples: 64, curves: [1, 1, 2, 1], beads: 4, spacingPx: 2.4, lineHalfPx: 0.5 },
+  // ~650 lines at K=6: curves * strands * 6 * 2
+  high: { strands: 10, samples: 112, curves: [1, 2, 3, 1], beads: 14, spacingPx: 2.0, lineHalfPx: 0.45 },
+  medium: { strands: 9, samples: 88, curves: [1, 2, 2, 1], beads: 10, spacingPx: 2.2, lineHalfPx: 0.45 },
+  low: { strands: 7, samples: 72, curves: [1, 1, 2, 1], beads: 6, spacingPx: 2.4, lineHalfPx: 0.5 },
+  fallback: { strands: 6, samples: 56, curves: [1, 1, 1, 1], beads: 4, spacingPx: 2.6, lineHalfPx: 0.5 },
 };
 
 const MAX_SECTORS = 10;
@@ -455,6 +531,14 @@ export class CurveRenderer {
   private nextPulseSlot = 0;
   private lastPulseTriggerMs = -Infinity;
   private lastRenderMs = performance.now();
+  private colorSmooth = {
+    bass: 0,
+    mid: 0,
+    high: 0,
+    onset: 0,
+    volume: 0,
+    activity: 0,
+  };
 
   private fpsFrames = 0;
   private fpsLast = performance.now();
@@ -569,6 +653,7 @@ export class CurveRenderer {
     const dt = Math.min(0.08, Math.max(0, (now - this.lastRenderMs) * 0.001));
     this.lastRenderMs = now;
     this.updatePulses(dt, now, features.onset, features.spectralFlux);
+    this.updateColorSmooth(dt, features);
     this.updateFps(now);
     const t = this.frozen ? this.frozenTime : (now - this.startMs) * 0.001;
     const breath = this.frozen ? 0.35 : 0.5 + 0.5 * Math.sin(t * 0.8);
@@ -583,7 +668,7 @@ export class CurveRenderer {
     if (!this.usePost || !this.trailA || !this.trailB) {
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
       gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
-      gl.clearColor(0.02, 0.012, 0.035, 1); // #050309
+      gl.clearColor(0.0, 0.0, 0.0, 1.0);
       gl.clear(gl.COLOR_BUFFER_BIT);
       this.drawField(t, breath, aspect, features, morph);
       return;
@@ -772,6 +857,12 @@ export class CurveRenderer {
     );
     gl.uniform4fv(u.uPulsePosition!, this.pulsePositions);
     gl.uniform4fv(u.uPulseAmplitude!, this.pulseAmplitudes);
+    gl.uniform1f(u.uColBass!, this.colorSmooth.bass);
+    gl.uniform1f(u.uColMid!, this.colorSmooth.mid);
+    gl.uniform1f(u.uColHigh!, this.colorSmooth.high);
+    gl.uniform1f(u.uColOnset!, this.colorSmooth.onset);
+    gl.uniform1f(u.uColVolume!, this.colorSmooth.volume);
+    gl.uniform1f(u.uColActivity!, this.colorSmooth.activity);
   }
 
   private drawRibbons(
@@ -986,11 +1077,59 @@ export class CurveRenderer {
       'uBundleSpacingPx',
       'uSamplesPerCurve',
       'uBeadSpeed',
+      'uColBass',
+      'uColMid',
+      'uColHigh',
+      'uColOnset',
+      'uColVolume',
+      'uColActivity',
     ];
     for (const n of names) {
       this.uRibbon[n] = this.gl.getUniformLocation(this.ribbonProg, n);
       this.uBead[n] = this.gl.getUniformLocation(this.beadProg, n);
     }
+  }
+
+
+  private updateColorSmooth(
+    dt: number,
+    features: {
+      volume: number;
+      bass: number;
+      mid: number;
+      treble: number;
+      transient: number;
+      onset: number;
+    },
+  ): void {
+    const follow = (cur: number, target: number, riseTau: number, fallTau: number) => {
+      const tau = target > cur ? riseTau : fallTau;
+      const k = 1 - Math.exp(-dt / Math.max(tau, 0.001));
+      return cur + (target - cur) * k;
+    };
+    this.colorSmooth.bass = follow(this.colorSmooth.bass, features.bass, 0.38, 0.58);
+    this.colorSmooth.mid = follow(this.colorSmooth.mid, features.mid, 0.32, 0.55);
+    this.colorSmooth.high = follow(
+      this.colorSmooth.high,
+      Math.min(1, features.treble * 0.85),
+      0.28,
+      0.5,
+    );
+    const pulsePeak = Math.max(
+      features.onset,
+      features.transient * 0.85,
+      this.pulseAmplitudes[0],
+      this.pulseAmplitudes[1],
+      this.pulseAmplitudes[2],
+      this.pulseAmplitudes[3],
+    );
+    this.colorSmooth.onset = follow(this.colorSmooth.onset, Math.min(1, pulsePeak), 0.12, 0.55);
+    this.colorSmooth.volume = follow(this.colorSmooth.volume, features.volume, 0.22, 0.45);
+    const activity = Math.min(
+      1,
+      features.bass * 0.35 + features.mid * 0.4 + features.treble * 0.25 + features.volume * 0.2,
+    );
+    this.colorSmooth.activity = follow(this.colorSmooth.activity, activity, 0.3, 0.5);
   }
 
   private updatePulses(
@@ -1088,6 +1227,12 @@ uniform float uViewportY;
 uniform float uLineHalfPx;
 uniform float uBundleSpacingPx;
 uniform float uSamplesPerCurve;
+uniform float uColBass;
+uniform float uColMid;
+uniform float uColHigh;
+uniform float uColOnset;
+uniform float uColVolume;
+uniform float uColActivity;
 
 uniform float uSectorCount;
 uniform float uGlobalPhase;
@@ -1105,7 +1250,7 @@ uniform vec4 uPulsePosition;
 uniform vec4 uPulseAmplitude;
 
 out float vAlpha;
-out float vColorMix;
+out vec3 vColor;
 
 ${CENTERLINE_GLSL}
 
@@ -1126,7 +1271,7 @@ void main() {
   if (aCopy.x >= sectorCount) {
     gl_Position = vec4(2.0, 2.0, 0.0, 1.0);
     vAlpha = 0.0;
-    vColorMix = 0.0;
+    vColor = vec3(0.0);
     return;
   }
 
@@ -1187,9 +1332,9 @@ void main() {
 
   float lw = layerWeightOf(layer, uLayerWeight);
   // Keep alpha low under additive blend so center overlaps stay linear
-  float alpha = mix(0.22, 0.10, lineRole) * lw;
-  alpha *= mix(1.0, 0.42, clamp(pol.x / max(uOuterReach, 0.55), 0.0, 1.0));
-  if (layer < 0.5) alpha *= 0.55;
+  float alpha = mix(0.38, 0.20, lineRole) * lw;
+  alpha *= mix(1.05, 0.55, clamp(pol.x / max(uOuterReach, 0.55), 0.0, 1.0));
+  if (layer < 0.5) alpha *= 0.72;
   if (layer > 2.5) {
     float gate = smoothstep(0.08, 0.55, 0.5 + 0.5 * sin(layerPhaseOf(layer, uLayerPhase) * 0.85 + curveId * 2.1 + phase));
     alpha *= mix(0.12, 1.0, gate);
@@ -1198,11 +1343,22 @@ void main() {
   alpha *= mix(1.0, 0.7, uReduceMotion);
 
   gl_Position = vec4(pos, 0.0, 1.0);
-  alpha *= mix(0.88, 1.02, uCentroid);
+  alpha *= mix(0.88, 1.0, uCentroid * 0.5);
   float dash = smoothstep(0.12, 0.4, abs(sin(u * TAU * (5.0 + uTreble * 2.5) + curveId)));
   alpha *= mix(0.78, 1.0, dash);
-  vAlpha = clamp(alpha, 0.0, 0.28);
-  vColorMix = clamp(0.12 + layer * 0.1 + uCentroid * 0.28 + rnd * 0.08, 0.0, 1.0);
+  vAlpha = clamp(alpha, 0.0, 0.48);
+
+  float rNorm = clamp(pol.x / max(uOuterReach, 0.55), 0.0, 1.2);
+  float pulseLocal = 0.0;
+  for (int i = 0; i < 4; i++) {
+    float d = rNorm - uPulsePosition[i];
+    pulseLocal += uPulseAmplitude[i] * exp(-(d * d) / 0.0065);
+  }
+  vColor = computeLineColor(
+    u, curveId, layer, strandOffset, phase, uTime, uReduceMotion,
+    uColBass, uColMid, uColHigh, uColOnset, uColVolume, uColActivity,
+    pulseLocal
+  );
 }
 `;
 }
