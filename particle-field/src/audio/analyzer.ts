@@ -1,4 +1,9 @@
 import { featureStore } from './featureStore';
+import {
+  centroidToPseudoPitch,
+  estimatePitch,
+  normalizePitchHz,
+} from './pitchDetector';
 import { attackRelease, clamp01, softLimit, smoothToward } from './smoother';
 import {
   SIGNAL_THRESHOLD_DBFS,
@@ -62,6 +67,8 @@ export class AudioAnalyzer {
   private lastAnalysisMs = performance.now();
   private lastOnsetMs = -Infinity;
   private lastBlob: Blob | null = null;
+  private pitchHistory: number[] = [];
+  private lastStablePitchHz = 220;
 
   get recordedBlob(): Blob | null {
     return this.lastBlob;
@@ -173,6 +180,8 @@ export class AudioAnalyzer {
     this.fluxFloor = 0.015;
     this.lastAnalysisMs = performance.now();
     this.lastOnsetMs = -Infinity;
+    this.pitchHistory = [];
+    this.lastStablePitchHz = 220;
     this.smoothed = { ...SILENT_FEATURES };
 
     this.timer = window.setInterval(() => this.tick(), 1000 / ANALYSIS_HZ);
@@ -368,6 +377,31 @@ export class AudioAnalyzer {
     const centroidHz = den > 1e-6 ? num / den : 1000;
     const centroidRaw = clamp01((centroidHz - 200) / 6000);
 
+    // Pitch / F0: McLeod-style NSDF; fall back to centroid when unvoiced
+    const pitchEst = hasSignal
+      ? estimatePitch(time, sampleRate)
+      : { hz: 0, confidence: 0, reliable: false };
+    let shapePitchHz: number;
+    let pitchConfidence = 0;
+    if (pitchEst.confidence > 0.65 && pitchEst.hz > 0) {
+      shapePitchHz = pitchEst.hz;
+      pitchConfidence = pitchEst.confidence;
+      this.lastStablePitchHz = pitchEst.hz;
+    } else if (hasSignal) {
+      shapePitchHz = centroidToPseudoPitch(centroidHz);
+      pitchConfidence = Math.max(0.2, pitchEst.confidence * 0.6);
+    } else {
+      shapePitchHz = this.lastStablePitchHz;
+      pitchConfidence = 0;
+    }
+
+    // Median of last 5 frames to reject single-frame pitch jumps
+    this.pitchHistory.push(shapePitchHz);
+    if (this.pitchHistory.length > 5) this.pitchHistory.shift();
+    const sorted = [...this.pitchHistory].sort((a, b) => a - b);
+    const medianHz = sorted[Math.floor(sorted.length / 2)] ?? shapePitchHz;
+    const pitchNormRaw = normalizePitchHz(medianHz);
+
     let positiveChange = 0;
     let spectrumEnergy = 0;
     const bins = Math.min(freqDb.length, this.prevSpectrum.length);
@@ -401,6 +435,21 @@ export class AudioAnalyzer {
       ? onset
       : attackRelease(this.smoothed.transient, 0, deltaMs, 1, 480);
 
+    // Pitch envelope: attack 120–220 ms, release 300–600 ms
+    const pitchNormalized = hasSignal
+      ? attackRelease(this.smoothed.pitchNormalized, pitchNormRaw, deltaMs, 170, 420)
+      : attackRelease(this.smoothed.pitchNormalized, 0.45, deltaMs, 80, 520);
+    const pitchHz = hasSignal
+      ? attackRelease(this.smoothed.pitchHz, medianHz, deltaMs, 170, 420)
+      : attackRelease(this.smoothed.pitchHz, this.lastStablePitchHz, deltaMs, 80, 520);
+    const pitchConfSmooth = attackRelease(
+      this.smoothed.pitchConfidence,
+      hasSignal ? pitchConfidence : 0,
+      deltaMs,
+      90,
+      380,
+    );
+
     this.smoothed = {
       timestampNanos: nowMs * 1e6,
       volume,
@@ -414,6 +463,9 @@ export class AudioAnalyzer {
       onset,
       transient,
       centroid: clamp01(smoothToward(this.smoothed.centroid, centroidRaw, 0.12, 0.06)),
+      pitchHz,
+      pitchNormalized: clamp01(pitchNormalized),
+      pitchConfidence: clamp01(pitchConfSmooth),
     };
 
     return this.smoothed;

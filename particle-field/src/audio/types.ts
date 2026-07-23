@@ -25,6 +25,12 @@ export interface AudioFeatures {
   onset: number;
   transient: number;
   centroid: number;
+  /** Detected / fallback fundamental in Hz (smoothed). */
+  pitchHz: number;
+  /** Log-normalized pitch 0..1 (80–1000 Hz). Drives seed shape. */
+  pitchNormalized: number;
+  /** Pitch detection confidence 0..1. */
+  pitchConfidence: number;
 }
 
 export const SILENT_FEATURES: AudioFeatures = {
@@ -40,6 +46,9 @@ export const SILENT_FEATURES: AudioFeatures = {
   onset: 0,
   transient: 0,
   centroid: 0.35,
+  pitchHz: 220,
+  pitchNormalized: 0.45,
+  pitchConfidence: 0,
 };
 
 /** dBFS above this counts as “有声音”. */

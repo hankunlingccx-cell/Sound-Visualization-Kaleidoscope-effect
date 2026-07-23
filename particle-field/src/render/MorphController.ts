@@ -59,21 +59,21 @@ export class MorphController {
 
   private foldAmount = 0.58;
   private lobeDepth = 0.16;
-  private outerReach = 0.78;
+  private outerReach = 0.86;
   private flowSpeed = 0.2;
   private topologyMix = 0.48;
   private waveOrderA = 3;
   private waveOrderB = 5;
   private angularFlow = 0.16;
-  private layerWeight = new Float32Array([0.55, 0.75, 1.1, 0.8]);
+  private layerWeight = new Float32Array([0.55, 0.75, 1.05, 1.05]);
 
   private foldTarget = 0.58;
   private lobeTarget = 0.16;
-  private outerTarget = 0.78;
+  private outerTarget = 0.86;
   private flowTarget = 0.2;
   private topoTarget = 0.48;
   private angFlowTarget = 0.16;
-  private weightTargets = new Float32Array([0.55, 0.75, 1.1, 0.8]);
+  private weightTargets = new Float32Array([0.55, 0.75, 1.05, 1.05]);
 
   private nextParamAt = 5.5;
   private paramEpoch = 1;
@@ -194,18 +194,19 @@ export class MorphController {
     const h = (k: number) => hash01(epoch * 13.1 + k * 7.7);
     this.foldTarget = lerp(0.18, 0.82, h(1));
     this.lobeTarget = lerp(0.05, 0.2, h(2));
-    this.outerTarget = lerp(0.48, 0.8, h(3));
+    this.outerTarget = lerp(0.62, 0.92, h(3));
     this.flowTarget = lerp(0.09, 0.3, h(4));
     this.topoTarget = lerp(0.1, 0.85, h(5));
     this.angFlowTarget = lerp(0.06, 0.2, h(6));
     this.waveOrderA = 2 + Math.floor(h(7) * 3); // 2..4
     this.waveOrderB = 4 + Math.floor(h(8) * 3); // 4..6
 
-    // Cyclic visual weight handover across layers
+    // Cyclic visual weight handover across layers — keep outer skeleton visible
     const peak = Math.floor(h(9) * 4);
     for (let i = 0; i < 4; i++) {
       const dist = Math.min(Math.abs(i - peak), 4 - Math.abs(i - peak));
-      this.weightTargets[i] = clamp(1.05 - dist * 0.28 + (h(10 + i) - 0.5) * 0.1, 0.45, 1.1);
+      const base = i === 3 ? 0.92 : 1.05;
+      this.weightTargets[i] = clamp(base - dist * 0.22 + (h(10 + i) - 0.5) * 0.1, 0.5, 1.15);
     }
   }
 }

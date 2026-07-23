@@ -1,4 +1,21 @@
 import { MorphController, type MorphUniforms } from './MorphController';
+import { PitchShapeController, type ShapeParams } from '../audio/pitchShape';
+import type { AudioFeatures } from '../audio/types';
+
+type RenderFeatures = Pick<
+  AudioFeatures,
+  | 'volume'
+  | 'bass'
+  | 'mid'
+  | 'treble'
+  | 'transient'
+  | 'centroid'
+  | 'spectralFlux'
+  | 'onset'
+  | 'pitchNormalized'
+  | 'pitchConfidence'
+  | 'hasSignal'
+>;
 
 /** Shared continuous centerline math for ribbons + bead particles. */
 const CENTERLINE_GLSL = `
@@ -38,11 +55,11 @@ float layerWeightOf(float layer, vec4 w) {
 
 float layerBaseRadius(float layer, float curveHash, float outerReach) {
   float t = fract(curveHash * 0.917 + 0.13);
-  // Core 0.04?0.18 / Inner 0.14?0.34 / Mid 0.28?0.55 / Outer 0.45?0.82
+  // Core / Inner / Mid / Outer ? outer skeleton starts farther out
   if (layer < 0.5) return mix(0.06, 0.16, t);
   if (layer < 1.5) return mix(0.16, 0.30, t);
-  if (layer < 2.5) return mix(0.30, 0.48, t);
-  return mix(0.48, clamp(outerReach, 0.55, 0.82), t);
+  if (layer < 2.5) return mix(0.30, 0.50, t);
+  return mix(0.52, clamp(outerReach, 0.62, 0.92), t);
 }
 
 float layerWarp(float layer, float foldAmount, float lobeDepth) {
@@ -53,8 +70,8 @@ float layerWarp(float layer, float foldAmount, float lobeDepth) {
 }
 
 // Returns polar (r, thetaLocal in [0,1]) in the base half-sector.
-// Kaleidoscope fill: K rotations x (+/- mirror) -> full 2*pi with no wedge gap.
-// Autonomous motion ~65%; audio modulates amplitude ~35%.
+// Pitch shape params rewrite the single seed; copies reuse the same geometry.
+// Volume only modulates brightness-linked wave amp + slight radial expansion.
 vec2 polarLocal(
   float u,
   float curveId,
@@ -63,8 +80,6 @@ vec2 polarLocal(
   float phase,
   float time,
   float volume,
-  float bass,
-  float mid,
   float treble,
   float transient,
   float foldAmount,
@@ -77,83 +92,128 @@ vec2 polarLocal(
   float angularFlow,
   vec4 layerPhase,
   vec4 pulsePosition,
-  vec4 pulseAmplitude
+  vec4 pulseAmplitude,
+  float bendFrequency,
+  float bendAmplitude,
+  float tipSharpness,
+  float radialStretch
 ) {
   float lp = layerPhaseOf(layer, layerPhase);
   float morph = time * flowSpeed;
   float n0 = smoothNoise3(vec3(curveId * 0.17, u * 1.35, morph * 0.065));
-  float n1 = smoothNoise3(vec3(curveId * 0.17 + 9.7, u * 1.05, morph * 0.048 + 4.0));
   float correlated = (n0 - 0.5) * 2.0;
 
   float inner = 1.0 - step(0.5, layer);
   float outer = step(2.5, layer);
   float middle = 1.0 - inner - outer;
-  float audioW = 0.32; // audio weight 25-40%
-  float autoW = 1.0 - audioW;
 
-  float waveA = sin(u * TAU * waveOrderA + morph * 0.23 + curveId + phase);
-  float waveB = cos(u * TAU * waveOrderB - morph * 0.17 + layer + lp);
-  float warp = layerWarp(layer, foldAmount, lobeDepth);
+  // Pitch owns geometry; autonomous morph is a soft base (~40%).
+  float pitchW = 0.72;
+  float autoW = 1.0 - pitchW;
 
-  // Seeds span the full half-sector [0,1] so +/-mirror x K fills the circle.
-  float seedA = fract(curveId * 0.61803398875 + rnd * 0.37);
-  float seedB = fract(curveId * 0.38196601125 + rnd * 0.53 + 0.17);
+  float bendFreq = mix(waveOrderA * 0.45, bendFrequency, pitchW);
+  float bendAmp = mix(lobeDepth * 1.1, bendAmplitude, pitchW);
+  float tipPow = mix(1.0, mix(0.78, 1.55, tipSharpness), pitchW);
+  float stretch = mix(1.0, radialStretch, pitchW);
+  // Mid-pitch fold peak: bendAmplitude is highest around mid shape
+  float foldDrive = mix(foldAmount, bendAmplitude * 1.35, pitchW);
 
-  // --- Topology A: arc ribbon / nested loop ---
-  float baseA = layerBaseRadius(layer, curveId + rnd, outerReach);
-  float spanA = inner * 0.10 + middle * mix(0.18, 0.28, step(1.5, layer)) + outer * 0.30;
-  float rA = baseA + spanA * u;
+  float waveA = sin(u * TAU * bendFreq + morph * 0.23 + curveId + phase);
+  float waveB = cos(u * TAU * mix(waveOrderB, bendFreq * 1.35, pitchW) - morph * 0.17 + layer + lp);
+  float warp = layerWarp(layer, foldDrive, bendAmp * 0.55);
+
+  // Spread seeds across half-sector; outer prefers edge anchors to seal wedge seams.
+  float slot = fract(curveId * 0.61803398875 + rnd * 0.11);
+  float edgeSlot = mix(0.06, 0.94, slot);
+  float outerEdge = mix(0.04, 0.96, step(0.5, fract(curveId * 0.5 + rnd)));
+  float seedA = mix(edgeSlot, outerEdge, outer * 0.72);
+  seedA = clamp(seedA + (rnd - 0.5) * mix(0.08, 0.03, outer), 0.02, 0.98);
+  float seedB = clamp(
+    mix(fract(curveId * 0.38196601125 + rnd * 0.53 + 0.17), 1.0 - seedA, outer * 0.55),
+    0.02,
+    0.98
+  );
+  float angTravel = mix(0.34, 0.22, tipSharpness);
+  angTravel *= inner * 0.75 + middle * 1.05 + outer * 1.28;
+  float edgeSafe = 1.0 - smoothstep(0.78, 0.98, abs(seedA - 0.5) * 2.0);
+
+  // --- Topology A: arc ribbon / nested loop (low: wide round) ---
+  float baseA = layerBaseRadius(layer, curveId + rnd, outerReach * stretch);
+  float spanA = inner * 0.10 + middle * mix(0.18, 0.30, step(1.5, layer)) + outer * 0.38;
+  // Low pitch ? wider radial fill; high pitch ? delayed tip growth
+  spanA *= mix(1.18, 0.82, tipSharpness);
+  float uRad = pow(clamp(u, 0.0, 1.0), tipPow);
+  float rA = baseA + spanA * uRad * stretch;
   rA += autoW * warp * (0.58 * waveA + 0.42 * waveB);
+  rA += pitchW * bendAmp * (0.55 * waveA + 0.35 * waveB) * mix(1.15, 0.55, tipSharpness);
   rA += autoW * correlated * (0.014 + middle * 0.02);
-  // Keep angular travel small so seeds near 0/1 still leave edge coverage.
-  float thA = seedA
-    + mix(0.16, 0.06, outer) * (u - 0.5)
-    + autoW * (0.07 + foldAmount * 0.10) * sin(u * TAU * mix(1.1, 2.2, n0) + phase + morph * 0.15)
-    + autoW * (0.04 + angularFlow * 0.35) * sin(u * TAU * waveOrderB - morph * 0.1 + lp);
 
-  // --- Topology B: radial tendril / open arc ---
-  float baseB = layerBaseRadius(layer, curveId + rnd + 3.1, outerReach);
-  float reachB = mix(0.22, 0.55, outer + middle * 0.55);
-  float rB = baseB + reachB * pow(u, mix(0.85, 1.25, outer));
-  rB += autoW * warp * 0.75 * sin(u * TAU * (waveOrderA * 0.5) + morph * 0.19 + phase);
+  // Angular fold: mid pitch maximizes S-curve / petal fold
+  float foldAng = (0.07 + foldDrive * 0.16) * sin(u * TAU * bendFreq + phase + morph * 0.15);
+  // Secondary fold-back (S-shape) strongest near mid tipSharpness ~0.4
+  float midFold = 1.0 - abs(tipSharpness - 0.42) * 2.2;
+  midFold = clamp(midFold, 0.0, 1.0);
+  foldAng += midFold * 0.11 * sin(u * TAU * (bendFreq * 0.5) + phase * 1.7 - morph * 0.09);
+  // High pitch: sharper local cusps, small amplitude
+  foldAng += tipSharpness * 0.055 * sin(u * TAU * (bendFreq * 1.8) + curveId);
+  foldAng *= edgeSafe;
+
+  float thA = seedA
+    + angTravel * (u - 0.5)
+    + autoW * (0.05 + foldAmount * 0.08) * edgeSafe
+      * sin(u * TAU * mix(1.1, 2.2, n0) + phase + morph * 0.15)
+    + pitchW * foldAng
+    + autoW * (0.03 + angularFlow * 0.28) * edgeSafe
+      * sin(u * TAU * waveOrderB - morph * 0.1 + lp);
+
+  // --- Topology B: radial tendril / open arc (outer skeleton) ---
+  float baseB = layerBaseRadius(layer, curveId + rnd + 3.1, outerReach * stretch);
+  float reachB = mix(0.22, 0.62, outer * 0.85 + middle * 0.55) * stretch;
+  reachB *= mix(1.15, 0.88, tipSharpness);
+  float rB = baseB + reachB * pow(u, mix(0.72, 1.35, tipSharpness));
+  rB += autoW * warp * 0.75 * sin(u * TAU * (bendFreq * 0.5) + morph * 0.19 + phase);
+  rB += pitchW * bendAmp * 0.7 * sin(u * TAU * bendFreq + morph * 0.19 + phase);
   rB += autoW * correlated * 0.02;
   float thB = seedB
-    + mix(0.14, 0.05, outer) * (u - 0.5)
-    + autoW * (0.06 + foldAmount * 0.09) * sin(u * TAU * 1.6 + phase - morph * 0.13)
-    + autoW * outer * 0.10 * sin(pow(u, 1.35) * TAU * 1.1 + phase + morph * 0.08);
+    + angTravel * mix(0.85, 1.15, outer) * (u - 0.5)
+    + autoW * (0.05 + foldAmount * 0.08) * edgeSafe
+      * sin(u * TAU * 1.6 + phase - morph * 0.13)
+    + pitchW * foldAng * 0.85
+    + tipSharpness * outer * 0.06 * sin(pow(u, 1.35) * TAU * bendFreq + phase)
+    + outer * 0.07 * sin(pow(u, 1.2) * TAU * 1.15 + phase + morph * 0.08);
 
-  float topo = smoothstep(0.0, 1.0, topologyMix);
+  float topo = smoothstep(0.0, 1.0, mix(topologyMix, tipSharpness * 0.55 + 0.25, pitchW * 0.5));
+  topo = mix(topo, mix(0.55, 0.82, tipSharpness), outer * 0.65);
   float r = mix(rA, rB, topo);
   float th = mix(thA, thB, topo);
 
-  // Audio modulation (does not replace autonomous base).
-  // Angular terms must be zero-mean; a DC bias opens a directional C-gap.
-  r += audioW * bass * (0.028 + layer * 0.014);
-  r += audioW * mid * lobeDepth * 0.55 * sin(u * TAU * waveOrderA + phase + lp);
-  r += audioW * volume * 0.018 * sin(morph * 0.31 + lp + u * TAU);
-  th += audioW * mid * (0.05 + foldAmount * 0.06)
-    * sin(u * TAU * mix(1.2, 2.4, n1) + phase + morph * 0.14);
-  th += audioW * treble * 0.04 * sin(u * TAU * waveOrderB - morph * 0.2 + curveId);
-  th += audioW * angularFlow * 0.08 * mid * sin(morph * 0.19 + lp + curveId);
+  // Volume: fluctuation amplitude + slight expansion (NOT shape type)
+  float volWave = volume * (0.012 + tipSharpness * 0.006);
+  r += volWave * sin(morph * 0.31 + lp + u * TAU);
+  r *= 1.0 + volume * 0.045;
+  // Timbre (treble) ? fine texture density only, small amp
+  th += treble * 0.014 * edgeSafe * sin(u * TAU * (bendFreq * 2.2) - morph * 0.2 + curveId);
+  r += treble * 0.008 * outer * sin(u * TAU * 4.0 + phase);
 
-  // Travelling burst wave from center (transient/onset)
-  float rNorm = clamp(r / max(outerReach, 0.55), 0.0, 1.2);
+  // Travelling burst wave from center (transient/onset) -- secondary feedback
+  float rNorm = clamp(r / max(outerReach * stretch, 0.55), 0.0, 1.2);
   float pulse = 0.0;
   for (int i = 0; i < 4; i++) {
     float d = rNorm - pulsePosition[i];
     pulse += pulseAmplitude[i] * exp(-(d * d) / 0.0065);
   }
-  r += pulse * (0.03 + middle * 0.035 + outer * 0.05);
-  th += pulse * 0.035 * sin(curveId * 2.3 + u * TAU + lp);
-  r += transient * audioW * 0.02 * outer * sin(u * TAU * 3.0 + morph);
+  r += pulse * (0.028 + middle * 0.03 + outer * 0.042);
+  th += pulse * 0.022 * edgeSafe * sin(curveId * 2.3 + u * TAU + lp);
+  r += transient * 0.014 * outer * sin(u * TAU * 3.0 + morph);
 
-  // Outer tendrils periodically retract (avoid static sun icon)
+  // Outer tendrils gently breathe -- keep skeleton mostly present
   if (outer > 0.5) {
-    float gate = 0.55 + 0.45 * sin(lp * 0.9 + curveId * 1.7 + morph * 0.07);
-    r = mix(baseA * 1.05, r, clamp(gate, 0.15, 1.0));
+    float gate = 0.72 + 0.28 * sin(lp * 0.9 + curveId * 1.7 + morph * 0.07);
+    r = mix(baseA * 1.12, r, clamp(gate, 0.45, 1.0));
   }
 
-  r = clamp(r, 0.04, outerReach + outer * 0.12);
+  float rMax = outerReach * stretch + outer * mix(0.20, 0.12, tipSharpness);
+  r = clamp(r, 0.04, rMax);
   th = clamp(th, 0.0, 1.0);
   return vec2(r, th);
 }
@@ -163,15 +223,23 @@ const LINE_FRAG = `#version 300 es
 precision mediump float;
 in float vAlpha;
 in float vColorMix;
+in float vPitch;
+in float vTransient;
 out vec4 fragColor;
 void main() {
-  // Silver / soft lilac primary; desaturated brand pink as accent
-  vec3 silver = vec3(0.90, 0.88, 0.96);
-  vec3 lilac = vec3(0.62, 0.56, 0.78);
-  vec3 softPink = vec3(0.78, 0.52, 0.70);
-  vec3 col = mix(silver, lilac, 0.42);
-  col = mix(col, softPink, vColorMix * 0.28);
-  col = mix(col, silver, 0.35);
+  // Pitch tint: low lake-blue ? mid mint (primary) ? high ice; onset soft mauve
+  vec3 lowCol = vec3(0.310, 0.663, 0.910);   // #4FA9E8
+  vec3 midCol = vec3(0.388, 0.878, 0.796);   // #63E0CB primary
+  vec3 highCol = vec3(0.851, 1.000, 0.973);  // #D9FFF8
+  vec3 onsetCol = vec3(0.847, 0.475, 0.784); // #D879C8
+  float p = clamp(vPitch, 0.0, 1.0);
+  vec3 pitchCol = p < 0.5
+    ? mix(lowCol, midCol, p * 2.0)
+    : mix(midCol, highCol, (p - 0.5) * 2.0);
+  // Keep mint as stable base ? high pitch never fully washes white
+  pitchCol = mix(midCol, pitchCol, 0.72);
+  vec3 col = mix(pitchCol, onsetCol, clamp(vTransient, 0.0, 1.0) * 0.45);
+  col = mix(col, midCol, 0.18);
   fragColor = vec4(col, vAlpha);
 }
 `;
@@ -183,12 +251,16 @@ layout(location = 2) in vec2 aCopy;
 
 uniform float uTime;
 uniform float uVolume;
-uniform float uBass;
-uniform float uMid;
 uniform float uTreble;
 uniform float uTransient;
 uniform float uFlux;
 uniform float uCentroid;
+uniform float uPitchNorm;
+uniform float uBendFrequency;
+uniform float uBendAmplitude;
+uniform float uBundleWidth;
+uniform float uTipSharpness;
+uniform float uRadialStretch;
 uniform float uAspect;
 uniform float uBreath;
 uniform float uReduceMotion;
@@ -212,6 +284,8 @@ uniform vec4 uPulseAmplitude;
 
 out float vAlpha;
 out float vColorMix;
+out float vPitch;
+out float vTransient;
 
 ${CENTERLINE_GLSL}
 
@@ -234,6 +308,8 @@ void main() {
     gl_PointSize = 0.0;
     vAlpha = 0.0;
     vColorMix = 0.0;
+    vPitch = uPitchNorm;
+    vTransient = 0.0;
     return;
   }
 
@@ -247,18 +323,22 @@ void main() {
   float effectiveVol = max(uVolume, uBreath * 0.025);
   vec2 pol = polarLocal(
     u, curveId, layer, rnd, phase, uTime,
-    effectiveVol, uBass, uMid, uTreble, uTransient,
+    effectiveVol, uTreble, uTransient,
     uFoldAmount, uLobeDepth, uOuterReach, uFlowSpeed, uTopologyMix,
     uWaveOrderA, uWaveOrderB, uAngularFlow, uLayerPhase,
-    uPulsePosition, uPulseAmplitude
+    uPulsePosition, uPulseAmplitude,
+    uBendFrequency, uBendAmplitude, uTipSharpness, uRadialStretch
   );
   vec2 p = toCartesian(pol, sectorCount, aCopy.x, aCopy.y, uGlobalPhase, uAspect);
 
   gl_Position = vec4(p, 0.0, 1.0);
-  gl_PointSize = mix(0.55, 0.85, rnd) + uTreble * 0.15;
+  gl_PointSize = mix(0.55, 0.85, rnd) + effectiveVol * 0.12;
   float lw = layerWeightOf(layer, uLayerWeight);
-  vAlpha = (0.055 + 0.06 * effectiveVol + uTransient * 0.05) * lw * uAlphaMul;
-  vColorMix = clamp(0.35 + uCentroid * 0.4 + rnd * 0.2, 0.0, 1.0);
+  // Volume ? brightness; transient ? brief sparkle
+  vAlpha = (0.055 + 0.10 * effectiveVol + uTransient * 0.05) * lw * uAlphaMul;
+  vColorMix = clamp(0.35 + uCentroid * 0.25 + rnd * 0.15, 0.0, 1.0);
+  vPitch = uPitchNorm;
+  vTransient = uTransient;
 }
 `;
 
@@ -266,15 +346,25 @@ const BEAD_FRAG = `#version 300 es
 precision mediump float;
 in float vAlpha;
 in float vColorMix;
+in float vPitch;
+in float vTransient;
 out vec4 fragColor;
 void main() {
   vec2 p = gl_PointCoord - vec2(0.5);
   float d = length(p);
   if (d > 0.5) discard;
   float g = smoothstep(0.5, 0.0, d);
-  vec3 silver = vec3(0.92, 0.9, 0.96);
-  vec3 pink = vec3(0.85, 0.55, 0.78);
-  fragColor = vec4(mix(silver, pink, vColorMix * 0.5), g * vAlpha);
+  vec3 lowCol = vec3(0.310, 0.663, 0.910);
+  vec3 midCol = vec3(0.388, 0.878, 0.796);
+  vec3 highCol = vec3(0.851, 1.000, 0.973);
+  vec3 onsetCol = vec3(0.847, 0.475, 0.784);
+  float pn = clamp(vPitch, 0.0, 1.0);
+  vec3 pitchCol = pn < 0.5
+    ? mix(lowCol, midCol, pn * 2.0)
+    : mix(midCol, highCol, (pn - 0.5) * 2.0);
+  pitchCol = mix(midCol, pitchCol, 0.72);
+  vec3 col = mix(pitchCol, onsetCol, clamp(vTransient, 0.0, 1.0) * 0.5);
+  fragColor = vec4(col, g * vAlpha);
 }
 `;
 
@@ -408,10 +498,11 @@ interface TierConfig {
 
 const TIER: Record<QualityTier, TierConfig> = {
   // Budget prioritizes parallel strands while staying interactive
-  high: { strands: 16, samples: 128, curves: [2, 3, 3, 2], beads: 20, spacingPx: 1.6, lineHalfPx: 0.45 },
-  medium: { strands: 12, samples: 96, curves: [2, 2, 3, 1], beads: 12, spacingPx: 1.8, lineHalfPx: 0.45 },
-  low: { strands: 9, samples: 80, curves: [1, 2, 2, 1], beads: 8, spacingPx: 2.1, lineHalfPx: 0.5 },
-  fallback: { strands: 7, samples: 64, curves: [1, 1, 2, 1], beads: 4, spacingPx: 2.4, lineHalfPx: 0.5 },
+  // curves: [core, inner, mid, outer] ? outer skeleton boosted
+  high: { strands: 16, samples: 128, curves: [2, 3, 3, 4], beads: 20, spacingPx: 1.6, lineHalfPx: 0.45 },
+  medium: { strands: 12, samples: 96, curves: [2, 2, 3, 3], beads: 12, spacingPx: 1.8, lineHalfPx: 0.45 },
+  low: { strands: 9, samples: 80, curves: [1, 2, 2, 2], beads: 8, spacingPx: 2.1, lineHalfPx: 0.5 },
+  fallback: { strands: 7, samples: 64, curves: [1, 1, 2, 2], beads: 4, spacingPx: 2.4, lineHalfPx: 0.5 },
 };
 
 const MAX_SECTORS = 10;
@@ -436,7 +527,10 @@ export class CurveRenderer {
   private quality: QualityTier = 'medium';
   private usePost = true;
   private morph = new MorphController();
+  private pitchShape = new PitchShapeController();
   private tierCfg = TIER.medium;
+  private activeShape: ShapeParams = this.pitchShape.getShape();
+  private heldPitchNorm = 0.45;
 
   private trailA: Fbo | null = null;
   private trailB: Fbo | null = null;
@@ -559,20 +653,19 @@ export class CurveRenderer {
     }
   }
 
-  render(features: {
-    volume: number;
-    bass: number;
-    mid: number;
-    treble: number;
-    transient: number;
-    centroid: number;
-    spectralFlux: number;
-    onset: number;
-  }): void {
+  render(features: RenderFeatures): void {
     const gl = this.gl;
     const now = performance.now();
     const dt = Math.min(0.08, Math.max(0, (now - this.lastRenderMs) * 0.001));
+    const deltaMs = dt * 1000;
     this.lastRenderMs = now;
+    this.activeShape = this.pitchShape.update(
+      features.pitchNormalized ?? 0.45,
+      features.pitchConfidence ?? 0,
+      features.hasSignal ?? features.volume > 0.04,
+      deltaMs,
+    );
+    this.heldPitchNorm = this.pitchShape.getHeldPitch();
     this.updatePulses(dt, now, features.onset, features.spectralFlux);
     this.updateFps(now);
     const t = this.frozen ? this.frozenTime : (now - this.startMs) * 0.001;
@@ -673,16 +766,7 @@ export class CurveRenderer {
     t: number,
     breath: number,
     aspect: number,
-    features: {
-      volume: number;
-      bass: number;
-      mid: number;
-      treble: number;
-      transient: number;
-      centroid: number;
-      spectralFlux: number;
-      onset: number;
-    },
+    features: RenderFeatures,
     morph: MorphUniforms,
   ): void {
     const mix = morph.sectorMix;
@@ -700,16 +784,7 @@ export class CurveRenderer {
     t: number,
     breath: number,
     aspect: number,
-    features: {
-      volume: number;
-      bass: number;
-      mid: number;
-      treble: number;
-      transient: number;
-      centroid: number;
-      spectralFlux: number;
-      onset: number;
-    },
+    features: RenderFeatures,
     morph: MorphUniforms,
     sectorCount: number,
     alphaMul: number,
@@ -727,26 +802,22 @@ export class CurveRenderer {
     t: number,
     breath: number,
     aspect: number,
-    features: {
-      volume: number;
-      bass: number;
-      mid: number;
-      treble: number;
-      transient: number;
-      centroid: number;
-      spectralFlux: number;
-      onset: number;
-    },
+    features: RenderFeatures,
   ): void {
     const gl = this.gl;
+    const shape = this.activeShape;
     gl.uniform1f(u.uTime!, t);
     gl.uniform1f(u.uVolume!, features.volume);
-    gl.uniform1f(u.uBass!, features.bass);
-    gl.uniform1f(u.uMid!, features.mid);
     gl.uniform1f(u.uTreble!, features.treble);
     gl.uniform1f(u.uTransient!, features.transient);
     gl.uniform1f(u.uFlux!, features.spectralFlux);
     gl.uniform1f(u.uCentroid!, features.centroid);
+    gl.uniform1f(u.uPitchNorm!, this.heldPitchNorm);
+    gl.uniform1f(u.uBendFrequency!, shape.bendFrequency);
+    gl.uniform1f(u.uBendAmplitude!, shape.bendAmplitude);
+    gl.uniform1f(u.uBundleWidth!, shape.bundleWidth);
+    gl.uniform1f(u.uTipSharpness!, shape.tipSharpness);
+    gl.uniform1f(u.uRadialStretch!, shape.radialStretch);
     gl.uniform1f(u.uAspect!, aspect);
     gl.uniform1f(u.uBreath!, breath);
     gl.uniform1f(u.uReduceMotion!, this.reduceMotion ? 1 : 0);
@@ -760,9 +831,12 @@ export class CurveRenderer {
       morph.layerPhase[2],
       morph.layerPhase[3],
     );
-    gl.uniform1f(u.uFoldAmount!, morph.foldAmount);
-    gl.uniform1f(u.uLobeDepth!, morph.lobeDepth);
-    gl.uniform1f(u.uOuterReach!, morph.outerReach);
+    // Pitch also nudges autonomous morph toward matching contour
+    const pitchFold = shape.bendAmplitude * 1.15;
+    const pitchOuter = morph.outerReach * shape.radialStretch;
+    gl.uniform1f(u.uFoldAmount!, morph.foldAmount * 0.35 + pitchFold * 0.65);
+    gl.uniform1f(u.uLobeDepth!, morph.lobeDepth * 0.3 + shape.bendAmplitude * 0.45);
+    gl.uniform1f(u.uOuterReach!, pitchOuter);
     gl.uniform1f(u.uFlowSpeed!, morph.flowSpeed);
     gl.uniform1f(u.uTopologyMix!, morph.topologyMix);
     gl.uniform1f(u.uWaveOrderA!, morph.waveOrderA);
@@ -783,16 +857,7 @@ export class CurveRenderer {
     t: number,
     breath: number,
     aspect: number,
-    features: {
-      volume: number;
-      bass: number;
-      mid: number;
-      treble: number;
-      transient: number;
-      centroid: number;
-      spectralFlux: number;
-      onset: number;
-    },
+    features: RenderFeatures,
     morph: MorphUniforms,
     sectorCount: number,
     alphaMul: number,
@@ -816,16 +881,7 @@ export class CurveRenderer {
     t: number,
     breath: number,
     aspect: number,
-    features: {
-      volume: number;
-      bass: number;
-      mid: number;
-      treble: number;
-      transient: number;
-      centroid: number;
-      spectralFlux: number;
-      onset: number;
-    },
+    features: RenderFeatures,
     morph: MorphUniforms,
     sectorCount: number,
     alphaMul: number,
@@ -837,7 +893,11 @@ export class CurveRenderer {
     gl.useProgram(this.beadProg);
     gl.bindVertexArray(this.beadVao);
     this.setMorphUniforms(this.uBead, morph, sectorCount, alphaMul, t, breath, aspect, features);
-    gl.uniform1f(this.uBead.uBeadSpeed!, 0.025 + features.spectralFlux * 0.13 + features.treble * 0.025);
+    // Spectral flux / treble ? detail motion only
+    gl.uniform1f(
+      this.uBead.uBeadSpeed!,
+      0.025 + features.spectralFlux * 0.1 + features.treble * 0.02,
+    );
     gl.drawArraysInstanced(gl.POINTS, 0, this.beadCount, this.beadInstanceCount);
     gl.bindVertexArray(null);
   }
@@ -962,12 +1022,16 @@ export class CurveRenderer {
     const names = [
       'uTime',
       'uVolume',
-      'uBass',
-      'uMid',
       'uTreble',
       'uTransient',
       'uFlux',
       'uCentroid',
+      'uPitchNorm',
+      'uBendFrequency',
+      'uBendAmplitude',
+      'uBundleWidth',
+      'uTipSharpness',
+      'uRadialStretch',
       'uAspect',
       'uBreath',
       'uReduceMotion',
@@ -1079,12 +1143,16 @@ layout(location = 2) in vec2 aCopy;
 
 uniform float uTime;
 uniform float uVolume;
-uniform float uBass;
-uniform float uMid;
 uniform float uTreble;
 uniform float uTransient;
 uniform float uFlux;
 uniform float uCentroid;
+uniform float uPitchNorm;
+uniform float uBendFrequency;
+uniform float uBendAmplitude;
+uniform float uBundleWidth;
+uniform float uTipSharpness;
+uniform float uRadialStretch;
 uniform float uAspect;
 uniform float uBreath;
 uniform float uReduceMotion;
@@ -1111,6 +1179,8 @@ uniform vec4 uPulseAmplitude;
 
 out float vAlpha;
 out float vColorMix;
+out float vPitch;
+out float vTransient;
 
 ${CENTERLINE_GLSL}
 
@@ -1132,6 +1202,8 @@ void main() {
     gl_Position = vec4(2.0, 2.0, 0.0, 1.0);
     vAlpha = 0.0;
     vColorMix = 0.0;
+    vPitch = uPitchNorm;
+    vTransient = 0.0;
     return;
   }
 
@@ -1148,10 +1220,11 @@ void main() {
   float effectiveVol = max(uVolume, uBreath * 0.025);
   vec2 pol = polarLocal(
     u, curveId, layer, rnd, phase, uTime,
-    effectiveVol, uBass, uMid, uTreble, uTransient,
+    effectiveVol, uTreble, uTransient,
     uFoldAmount, uLobeDepth, uOuterReach, uFlowSpeed, uTopologyMix,
     uWaveOrderA, uWaveOrderB, uAngularFlow, uLayerPhase,
-    uPulsePosition, uPulseAmplitude
+    uPulsePosition, uPulseAmplitude,
+    uBendFrequency, uBendAmplitude, uTipSharpness, uRadialStretch
   );
 
   // Derive a true curve normal from neighboring correlated samples. Offsetting
@@ -1159,17 +1232,19 @@ void main() {
   float du = 1.0 / max(48.0, uSamplesPerCurve - 1.0);
   vec2 polA = polarLocal(
     clamp(u - du, 0.0, 1.0), curveId, layer, rnd, phase, uTime,
-    effectiveVol, uBass, uMid, uTreble, uTransient,
+    effectiveVol, uTreble, uTransient,
     uFoldAmount, uLobeDepth, uOuterReach, uFlowSpeed, uTopologyMix,
     uWaveOrderA, uWaveOrderB, uAngularFlow, uLayerPhase,
-    uPulsePosition, uPulseAmplitude
+    uPulsePosition, uPulseAmplitude,
+    uBendFrequency, uBendAmplitude, uTipSharpness, uRadialStretch
   );
   vec2 polB = polarLocal(
     clamp(u + du, 0.0, 1.0), curveId, layer, rnd, phase, uTime,
-    effectiveVol, uBass, uMid, uTreble, uTransient,
+    effectiveVol, uTreble, uTransient,
     uFoldAmount, uLobeDepth, uOuterReach, uFlowSpeed, uTopologyMix,
     uWaveOrderA, uWaveOrderB, uAngularFlow, uLayerPhase,
-    uPulsePosition, uPulseAmplitude
+    uPulsePosition, uPulseAmplitude,
+    uBendFrequency, uBendAmplitude, uTipSharpness, uRadialStretch
   );
   vec2 pos = toCartesian(pol, sectorCount, rotationIndex, mirrorSign, uGlobalPhase, uAspect);
   vec2 posA = toCartesian(polA, sectorCount, rotationIndex, mirrorSign, uGlobalPhase, uAspect);
@@ -1178,36 +1253,42 @@ void main() {
   vec2 normalPx = vec2(-tangentPx.y, tangentPx.x);
 
   float bundleNoise = smoothNoise3(vec3(curveId * 0.2 + 21.0, u * 1.15, uTime * 0.035));
-  // Stable parallel spacing 1.2?3.5 px class; only mild radius-linked expansion
+  // Pitch ? bundle width; volume only mild gather breathe
   float gather = 0.92
     + 0.10 * sin(u * TAU * 0.85 + phase + uTime * 0.08)
-    + (bundleNoise - 0.5) * 0.08;
-  gather = clamp(gather, 0.78, 1.18);
+    + (bundleNoise - 0.5) * 0.08
+    + effectiveVol * 0.04;
+  gather = clamp(gather, 0.78, 1.22);
   float radiusExpand = 1.0 + clamp(pol.x / max(uOuterReach, 0.55), 0.0, 1.0) * 0.35;
-  float localSpacingPx = uBundleSpacingPx * gather * radiusExpand * (1.0 + uBass * 0.22);
+  float localSpacingPx = uBundleSpacingPx * uBundleWidth * gather * radiusExpand;
   float offsetPx = strandOffset * localSpacingPx;
   vec2 offsetNdc = vec2(normalPx.x / max(uAspect, 0.001), normalPx.y)
     * (2.0 * offsetPx / max(uViewportY, 1.0));
   pos += offsetNdc;
 
   float lw = layerWeightOf(layer, uLayerWeight);
-  // Keep alpha low under additive blend so center overlaps stay linear
+  // Volume ? brightness; centroid mildly assists warm/cool bias via alpha
   float alpha = mix(0.22, 0.10, lineRole) * lw;
-  alpha *= mix(1.0, 0.42, clamp(pol.x / max(uOuterReach, 0.55), 0.0, 1.0));
+  alpha *= mix(1.0, mix(0.42, 0.62, step(2.5, layer)), clamp(pol.x / max(uOuterReach, 0.55), 0.0, 1.0));
   if (layer < 0.5) alpha *= 0.55;
   if (layer > 2.5) {
     float gate = smoothstep(0.08, 0.55, 0.5 + 0.5 * sin(layerPhaseOf(layer, uLayerPhase) * 0.85 + curveId * 2.1 + phase));
-    alpha *= mix(0.12, 1.0, gate);
+    // Keep outer skeleton mostly visible; only gentle breathing
+    alpha *= mix(0.55, 1.0, gate);
   }
   alpha *= uAlphaMul;
   alpha *= mix(1.0, 0.7, uReduceMotion);
+  alpha *= mix(0.72, 1.18, effectiveVol);
+  alpha *= mix(0.92, 1.05, uCentroid);
 
   gl_Position = vec4(pos, 0.0, 1.0);
-  alpha *= mix(0.88, 1.02, uCentroid);
-  float dash = smoothstep(0.12, 0.4, abs(sin(u * TAU * (5.0 + uTreble * 2.5) + curveId)));
+  // Timbre ? dash density (texture), not silhouette
+  float dash = smoothstep(0.12, 0.4, abs(sin(u * TAU * (5.0 + uTreble * 1.8) + curveId)));
   alpha *= mix(0.78, 1.0, dash);
-  vAlpha = clamp(alpha, 0.0, 0.28);
-  vColorMix = clamp(0.12 + layer * 0.1 + uCentroid * 0.28 + rnd * 0.08, 0.0, 1.0);
+  vAlpha = clamp(alpha, 0.0, 0.32);
+  vColorMix = clamp(0.12 + layer * 0.1 + uCentroid * 0.2 + rnd * 0.08, 0.0, 1.0);
+  vPitch = uPitchNorm;
+  vTransient = uTransient;
 }
 `;
 }

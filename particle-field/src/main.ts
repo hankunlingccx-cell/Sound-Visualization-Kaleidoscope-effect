@@ -27,7 +27,7 @@ app.innerHTML = `
       </div>
       <div class="meters" aria-hidden="true">
         <div class="meter"><span>VOL</span><i id="mVol"></i></div>
-        <div class="meter"><span>BASS</span><i id="mBass"></i></div>
+        <div class="meter"><span>PITCH</span><i id="mPitch"></i></div>
         <div class="meter"><span>MID</span><i id="mMid"></i></div>
         <div class="meter"><span>TRE</span><i id="mTre"></i></div>
       </div>
@@ -62,7 +62,7 @@ app.innerHTML = `
         <p class="mic-monitor__device-label" id="micDeviceLabel">尚未连接麦克风</p>
       </div>
 
-      <p class="hint" id="hint">授权麦克风后，声音会调制线束的折叠、触须与层间流动；静音时曲线仍会持续缓慢形变。</p>
+      <p class="hint" id="hint">授权麦克风后：音调改变主体轮廓（低音宽圆、中音折叠、高音锐利），音量只调亮度与波动；静音时曲线仍缓慢形变。</p>
       <p class="error" id="error" hidden></p>
     </section>
 
@@ -93,7 +93,7 @@ const btnPrimary = document.querySelector<HTMLButtonElement>('#btnPrimary')!;
 const btnStop = document.querySelector<HTMLButtonElement>('#btnStop')!;
 const btnDownload = document.querySelector<HTMLAnchorElement>('#btnDownload')!;
 const mVol = document.querySelector<HTMLElement>('#mVol')!;
-const mBass = document.querySelector<HTMLElement>('#mBass')!;
+const mPitch = document.querySelector<HTMLElement>('#mPitch')!;
 const mMid = document.querySelector<HTMLElement>('#mMid')!;
 const mTre = document.querySelector<HTMLElement>('#mTre')!;
 const micMonitor = document.querySelector<HTMLElement>('#micMonitor')!;
@@ -245,7 +245,7 @@ async function startRecording(): Promise<void> {
     state = 'Recording';
     syncUi();
     hintEl.textContent =
-      '对着麦克风说话。声音会加强折叠与外层触须；静音时结构仍会缓慢演化。';
+      '对着麦克风发低音／人声／高音。音调驱动主曲线形状，音量只改变亮度与波动幅度。';
     startClock();
     try {
       navigator.vibrate?.(12);
@@ -371,7 +371,7 @@ function frame(): void {
   renderer.render(features);
 
   mVol.style.transform = `scaleX(${Math.max(0.02, features.volume)})`;
-  mBass.style.transform = `scaleX(${Math.max(0.02, features.bass)})`;
+  mPitch.style.transform = `scaleX(${Math.max(0.02, features.pitchNormalized)})`;
   mMid.style.transform = `scaleX(${Math.max(0.02, features.mid)})`;
   mTre.style.transform = `scaleX(${Math.max(0.02, features.treble)})`;
 
