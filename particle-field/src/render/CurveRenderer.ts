@@ -122,20 +122,24 @@ vec2 polarLocal(
   float waveB = cos(u * TAU * mix(waveOrderB, bendFreq * 1.35, pitchW) - morph * 0.17 + layer + lp);
   float warp = layerWarp(layer, foldDrive, bendAmp * 0.55);
 
-  // Spread seeds across half-sector; outer prefers edge anchors to seal wedge seams.
-  float slot = fract(curveId * 0.61803398875 + rnd * 0.11);
-  float edgeSlot = mix(0.06, 0.94, slot);
-  float outerEdge = mix(0.04, 0.96, step(0.5, fract(curveId * 0.5 + rnd)));
-  float seedA = mix(edgeSlot, outerEdge, outer * 0.72);
-  seedA = clamp(seedA + (rnd - 0.5) * mix(0.08, 0.03, outer), 0.02, 0.98);
-  float seedB = clamp(
-    mix(fract(curveId * 0.38196601125 + rnd * 0.53 + 0.17), 1.0 - seedA, outer * 0.55),
-    0.02,
-    0.98
-  );
-  float angTravel = mix(0.34, 0.22, tipSharpness);
-  angTravel *= inner * 0.75 + middle * 1.05 + outer * 1.28;
-  float edgeSafe = 1.0 - smoothstep(0.78, 0.98, abs(seedA - 0.5) * 2.0);
+  // Stable angular homes evenly spanning half-sector [0,1].
+  // Do NOT smoothstep homes toward center ? that periodically opens C-gaps at seams.
+  float home = fract(curveId * 0.61803398875 + rnd * 0.05 + layer * 0.11);
+  home = mix(0.03, 0.97, home);
+  // Dedicated outer edge rails (alternate near 0 / near 1)
+  float rail = mix(0.05, 0.95, step(0.5, fract(curveId * 0.37 + rnd)));
+  float seedA = mix(home, rail, outer * 0.7);
+  float seedB = mix(clamp(home + 0.33, 0.03, 0.97), 1.0 - rail, outer * 0.55);
+  seedB = clamp(seedB, 0.03, 0.97);
+
+  // Cap angular wobble so neighbors cannot open a lasting hole
+  float maxWobble = mix(0.08, 0.045, tipSharpness);
+  maxWobble *= mix(1.0, 0.4, abs(seedA - 0.5) * 2.0); // quieter near seams
+  maxWobble = max(maxWobble, 0.025);
+
+  // Mid fills wedge with moderate sweep; outer = circumferential skeleton arcs
+  float angTravel = mix(0.42, 0.22, tipSharpness);
+  angTravel = mix(angTravel, mix(0.92, 0.7, tipSharpness), outer);
 
   // --- Topology A: arc ribbon / nested loop (low: wide round) ---
   float baseA = layerBaseRadius(layer, curveId + rnd, outerReach * stretch);
@@ -148,23 +152,22 @@ vec2 polarLocal(
   rA += pitchW * bendAmp * (0.55 * waveA + 0.35 * waveB) * mix(1.15, 0.55, tipSharpness);
   rA += autoW * correlated * (0.014 + middle * 0.02);
 
-  // Angular fold: mid pitch maximizes S-curve / petal fold
-  float foldAng = (0.07 + foldDrive * 0.16) * sin(u * TAU * bendFreq + phase + morph * 0.15);
-  // Secondary fold-back (S-shape) strongest near mid tipSharpness ~0.4
+  // Angular fold: mid pitch maximizes S-curve / petal fold (amplitude capped)
+  float foldAng = (0.05 + foldDrive * 0.10) * sin(u * TAU * bendFreq + phase + morph * 0.15);
   float midFold = 1.0 - abs(tipSharpness - 0.42) * 2.2;
   midFold = clamp(midFold, 0.0, 1.0);
-  foldAng += midFold * 0.11 * sin(u * TAU * (bendFreq * 0.5) + phase * 1.7 - morph * 0.09);
-  // High pitch: sharper local cusps, small amplitude
-  foldAng += tipSharpness * 0.055 * sin(u * TAU * (bendFreq * 1.8) + curveId);
-  foldAng *= edgeSafe;
+  foldAng += midFold * 0.07 * sin(u * TAU * (bendFreq * 0.5) + phase * 1.7 - morph * 0.09);
+  foldAng += tipSharpness * 0.035 * sin(u * TAU * (bendFreq * 1.8) + curveId);
+  foldAng = clamp(foldAng, -maxWobble, maxWobble);
 
+  // Direction of circumferential sweep for outer skeleton (+/- alternate)
+  float sweepDir = mix(1.0, -1.0, step(0.5, fract(curveId * 0.5 + rnd * 0.3)));
   float thA = seedA
-    + angTravel * (u - 0.5)
-    + autoW * (0.05 + foldAmount * 0.08) * edgeSafe
-      * sin(u * TAU * mix(1.1, 2.2, n0) + phase + morph * 0.15)
+    + sweepDir * angTravel * (u - 0.5)
+    + autoW * 0.04 * sin(u * TAU * mix(1.1, 2.0, n0) + phase + morph * 0.12)
     + pitchW * foldAng
-    + autoW * (0.03 + angularFlow * 0.28) * edgeSafe
-      * sin(u * TAU * waveOrderB - morph * 0.1 + lp);
+    + autoW * 0.025 * sin(u * TAU * waveOrderB - morph * 0.1 + lp);
+  thA = clamp(thA, 0.02, 0.98);
 
   // --- Topology B: radial tendril / open arc (outer skeleton) ---
   float baseB = layerBaseRadius(layer, curveId + rnd + 3.1, outerReach * stretch);
@@ -174,16 +177,26 @@ vec2 polarLocal(
   rB += autoW * warp * 0.75 * sin(u * TAU * (bendFreq * 0.5) + morph * 0.19 + phase);
   rB += pitchW * bendAmp * 0.7 * sin(u * TAU * bendFreq + morph * 0.19 + phase);
   rB += autoW * correlated * 0.02;
-  float thB = seedB
-    + angTravel * mix(0.85, 1.15, outer) * (u - 0.5)
-    + autoW * (0.05 + foldAmount * 0.08) * edgeSafe
-      * sin(u * TAU * 1.6 + phase - morph * 0.13)
-    + pitchW * foldAng * 0.85
-    + tipSharpness * outer * 0.06 * sin(pow(u, 1.35) * TAU * bendFreq + phase)
-    + outer * 0.07 * sin(pow(u, 1.2) * TAU * 1.15 + phase + morph * 0.08);
+  // Outer: nearly full half-sector arc (skeleton ring); others: home + travel
+  float outerU = mix(u, 1.0 - u, step(0.5, fract(curveId * 0.5)));
+  float thB = mix(
+    seedB + angTravel * (u - 0.5),
+    mix(0.04, 0.96, outerU),
+    outer
+  );
+  thB += clamp(
+    pitchW * foldAng * 0.7
+      + autoW * 0.035 * sin(u * TAU * 1.6 + phase - morph * 0.13)
+      + tipSharpness * outer * 0.04 * sin(pow(u, 1.35) * TAU * bendFreq + phase),
+    -maxWobble,
+    maxWobble
+  );
+  thB = clamp(thB, 0.02, 0.98);
 
-  float topo = smoothstep(0.0, 1.0, mix(topologyMix, tipSharpness * 0.55 + 0.25, pitchW * 0.5));
-  topo = mix(topo, mix(0.55, 0.82, tipSharpness), outer * 0.65);
+  // Keep topology away from extremes that collapse sector fill
+  float topo = smoothstep(0.0, 1.0, mix(topologyMix, tipSharpness * 0.45 + 0.3, pitchW * 0.45));
+  topo = clamp(topo, 0.25, 0.75);
+  topo = mix(topo, mix(0.45, 0.7, tipSharpness), outer * 0.5);
   float r = mix(rA, rB, topo);
   float th = mix(thA, thB, topo);
 
@@ -192,7 +205,7 @@ vec2 polarLocal(
   r += volWave * sin(morph * 0.31 + lp + u * TAU);
   r *= 1.0 + volume * 0.045;
   // Timbre (treble) ? fine texture density only, small amp
-  th += treble * 0.014 * edgeSafe * sin(u * TAU * (bendFreq * 2.2) - morph * 0.2 + curveId);
+  th += treble * 0.012 * sin(u * TAU * (bendFreq * 2.2) - morph * 0.2 + curveId);
   r += treble * 0.008 * outer * sin(u * TAU * 4.0 + phase);
 
   // Travelling burst wave from center (transient/onset) -- secondary feedback
@@ -203,18 +216,18 @@ vec2 polarLocal(
     pulse += pulseAmplitude[i] * exp(-(d * d) / 0.0065);
   }
   r += pulse * (0.028 + middle * 0.03 + outer * 0.042);
-  th += pulse * 0.022 * edgeSafe * sin(curveId * 2.3 + u * TAU + lp);
+  th += clamp(pulse * 0.018 * sin(curveId * 2.3 + u * TAU + lp), -maxWobble, maxWobble);
   r += transient * 0.014 * outer * sin(u * TAU * 3.0 + morph);
 
-  // Outer tendrils gently breathe -- keep skeleton mostly present
+  // Outer skeleton stays extended ? no periodic retract (was causing incomplete lobes)
   if (outer > 0.5) {
-    float gate = 0.72 + 0.28 * sin(lp * 0.9 + curveId * 1.7 + morph * 0.07);
-    r = mix(baseA * 1.12, r, clamp(gate, 0.45, 1.0));
+    float breathe = 0.92 + 0.08 * sin(lp * 0.7 + curveId * 1.3 + morph * 0.05);
+    r *= breathe;
   }
 
   float rMax = outerReach * stretch + outer * mix(0.20, 0.12, tipSharpness);
   r = clamp(r, 0.04, rMax);
-  th = clamp(th, 0.0, 1.0);
+  th = clamp(th, 0.02, 0.98);
   return vec2(r, th);
 }
 `;
@@ -500,9 +513,9 @@ const TIER: Record<QualityTier, TierConfig> = {
   // Budget prioritizes parallel strands while staying interactive
   // curves: [core, inner, mid, outer] ? outer skeleton boosted
   high: { strands: 16, samples: 128, curves: [2, 3, 3, 4], beads: 20, spacingPx: 1.6, lineHalfPx: 0.45 },
-  medium: { strands: 12, samples: 96, curves: [2, 2, 3, 3], beads: 12, spacingPx: 1.8, lineHalfPx: 0.45 },
-  low: { strands: 9, samples: 80, curves: [1, 2, 2, 2], beads: 8, spacingPx: 2.1, lineHalfPx: 0.5 },
-  fallback: { strands: 7, samples: 64, curves: [1, 1, 2, 2], beads: 4, spacingPx: 2.4, lineHalfPx: 0.5 },
+  medium: { strands: 12, samples: 96, curves: [2, 3, 3, 4], beads: 12, spacingPx: 1.8, lineHalfPx: 0.45 },
+  low: { strands: 9, samples: 80, curves: [1, 2, 3, 3], beads: 8, spacingPx: 2.1, lineHalfPx: 0.5 },
+  fallback: { strands: 7, samples: 64, curves: [1, 2, 2, 3], beads: 4, spacingPx: 2.4, lineHalfPx: 0.5 },
 };
 
 const MAX_SECTORS = 10;
@@ -1269,13 +1282,9 @@ void main() {
   float lw = layerWeightOf(layer, uLayerWeight);
   // Volume ? brightness; centroid mildly assists warm/cool bias via alpha
   float alpha = mix(0.22, 0.10, lineRole) * lw;
-  alpha *= mix(1.0, mix(0.42, 0.62, step(2.5, layer)), clamp(pol.x / max(uOuterReach, 0.55), 0.0, 1.0));
+  alpha *= mix(1.0, mix(0.5, 0.78, step(2.5, layer)), clamp(pol.x / max(uOuterReach, 0.55), 0.0, 1.0));
   if (layer < 0.5) alpha *= 0.55;
-  if (layer > 2.5) {
-    float gate = smoothstep(0.08, 0.55, 0.5 + 0.5 * sin(layerPhaseOf(layer, uLayerPhase) * 0.85 + curveId * 2.1 + phase));
-    // Keep outer skeleton mostly visible; only gentle breathing
-    alpha *= mix(0.55, 1.0, gate);
-  }
+  // Outer skeleton stays visible ? removed periodic alpha gate that punched holes
   alpha *= uAlphaMul;
   alpha *= mix(1.0, 0.7, uReduceMotion);
   alpha *= mix(0.72, 1.18, effectiveVol);

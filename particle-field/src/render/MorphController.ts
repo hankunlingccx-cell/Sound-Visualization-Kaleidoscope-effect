@@ -158,20 +158,27 @@ export class MorphController {
       this.nextParamAt = t + 4 + hash01(this.paramEpoch * 17.3) * 5;
     }
 
-    // Sector count crossfade every 12–24s
-    if (!this.sectorTransitioning && t >= this.nextSectorAt) {
-      this.beginSectorTransition(t);
-    }
-    if (this.sectorTransitioning) {
-      const u = (t - this.sectorTransitionStart) / this.sectorTransitionDur;
-      if (u >= 1) {
-        this.sectorA = this.sectorB;
-        this.sectorMix = 1;
-        this.sectorTransitioning = false;
-        this.nextSectorAt = t + 12 + hash01(this.paramEpoch * 9.1) * 12;
-      } else {
-        this.sectorMix = smoothstep(0, 1, u);
+    // Sector count locked to 6 — skip no-op transitions that used to restart mix
+    if (SECTOR_OPTIONS.length > 1) {
+      if (!this.sectorTransitioning && t >= this.nextSectorAt) {
+        this.beginSectorTransition(t);
       }
+      if (this.sectorTransitioning) {
+        const u = (t - this.sectorTransitionStart) / this.sectorTransitionDur;
+        if (u >= 1) {
+          this.sectorA = this.sectorB;
+          this.sectorMix = 1;
+          this.sectorTransitioning = false;
+          this.nextSectorAt = t + 12 + hash01(this.paramEpoch * 9.1) * 12;
+        } else {
+          this.sectorMix = smoothstep(0, 1, u);
+        }
+      }
+    } else {
+      this.sectorA = 6;
+      this.sectorB = 6;
+      this.sectorMix = 1;
+      this.sectorTransitioning = false;
     }
   }
 
@@ -192,21 +199,23 @@ export class MorphController {
 
   private pickNewTargets(epoch: number): void {
     const h = (k: number) => hash01(epoch * 13.1 + k * 7.7);
-    this.foldTarget = lerp(0.18, 0.82, h(1));
-    this.lobeTarget = lerp(0.05, 0.2, h(2));
-    this.outerTarget = lerp(0.62, 0.92, h(3));
-    this.flowTarget = lerp(0.09, 0.3, h(4));
-    this.topoTarget = lerp(0.1, 0.85, h(5));
-    this.angFlowTarget = lerp(0.06, 0.2, h(6));
+    // Keep fold/topology in a coverage-safe band — extremes periodically opened C-gaps
+    this.foldTarget = lerp(0.28, 0.55, h(1));
+    this.lobeTarget = lerp(0.08, 0.18, h(2));
+    this.outerTarget = lerp(0.72, 0.9, h(3));
+    this.flowTarget = lerp(0.09, 0.26, h(4));
+    this.topoTarget = lerp(0.35, 0.62, h(5));
+    this.angFlowTarget = lerp(0.06, 0.16, h(6));
     this.waveOrderA = 2 + Math.floor(h(7) * 3); // 2..4
     this.waveOrderB = 4 + Math.floor(h(8) * 3); // 4..6
 
-    // Cyclic visual weight handover across layers — keep outer skeleton visible
+    // Soft weight cycling — never starve outer skeleton (floor 0.85)
     const peak = Math.floor(h(9) * 4);
     for (let i = 0; i < 4; i++) {
       const dist = Math.min(Math.abs(i - peak), 4 - Math.abs(i - peak));
-      const base = i === 3 ? 0.92 : 1.05;
-      this.weightTargets[i] = clamp(base - dist * 0.22 + (h(10 + i) - 0.5) * 0.1, 0.5, 1.15);
+      const floor = i === 3 ? 0.85 : 0.55;
+      const base = i === 3 ? 1.05 : 1.0;
+      this.weightTargets[i] = clamp(base - dist * 0.14 + (h(10 + i) - 0.5) * 0.06, floor, 1.15);
     }
   }
 }
